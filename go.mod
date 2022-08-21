@@ -75,9 +75,6 @@ require (
 	modernc.org/sqlite v1.18.1
 	pgregory.net/rapid v0.4.7
 )
-<<<<<<< HEAD
-replace "github.com/ledgerwatch/erigon-lib" v0.0.0-20220112034433-e9d17496158c => "../erigon-lib"
-=======
 
 require (
 	crawshaw.io/sqlite v0.3.3-0.20210127221821-98b1f83c5508 // indirect
@@ -176,4 +173,5 @@ require (
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
 	gotest.tools/v3 v3.3.0 // indirect
 )
->>>>>>> devel
+
+replace "github.com/ledgerwatch/erigon-lib" v0.0.0-20220819042719-4c744ae88a33 => "../erigon-lib"

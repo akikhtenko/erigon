@@ -372,12 +372,6 @@ func UnwindSendersStage(s *UnwindState, tx kv.RwTx, cfg SendersCfg, ctx context.
 }
 
 func PruneSendersStage(s *PruneState, tx kv.RwTx, cfg SendersCfg, ctx context.Context) (err error) {
-<<<<<<< HEAD
-	if true { //!cfg.prune.TxIndex.Enabled() {
-		return nil
-	}
-=======
->>>>>>> devel
 	logEvery := time.NewTicker(logInterval)
 	defer logEvery.Stop()
 	useExternalTx := tx != nil
@@ -399,10 +393,10 @@ func PruneSendersStage(s *PruneState, tx kv.RwTx, cfg SendersCfg, ctx context.Co
 			return fmt.Errorf("retireBlocksInSingleBackgroundThread: %w", err)
 		}
 	} else if cfg.prune.TxIndex.Enabled() {
-		to := cfg.prune.TxIndex.PruneTo(s.ForwardProgress)
+		/*to := cfg.prune.TxIndex.PruneTo(s.ForwardProgress)
 		if err = rawdb.PruneTable(tx, kv.Senders, to, ctx, 1_000); err != nil {
 			return err
-		}
+		}*/
 	}
 
 	if !useExternalTx {
