@@ -20,6 +20,7 @@ type putDel interface {
 type PlainStateWriter struct {
 	db          putDel
 	csw         *ChangeSetWriter
+	postCsw     *ChangeSetWriter
 	accumulator *shards.Accumulator
 }
 
@@ -30,9 +31,10 @@ func NewPlainStateWriter(db putDel, changeSetsDB kv.RwTx, blockNumber uint64) *P
 	}
 }
 
-func NewPlainStateWriterNoHistory(db putDel) *PlainStateWriter {
+func NewPlainStateWriterNoHistory(db putDel, changeSetsDB kv.RwTx, blockNumber uint64) *PlainStateWriter {
 	return &PlainStateWriter{
-		db: db,
+		db:      db,
+		postCsw: NewChangeSetWriterPlain(changeSetsDB, blockNumber),
 	}
 }
 
@@ -44,6 +46,11 @@ func (w *PlainStateWriter) SetAccumulator(accumulator *shards.Accumulator) *Plai
 func (w *PlainStateWriter) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
 	if w.csw != nil {
 		if err := w.csw.UpdateAccountData(address, original, account); err != nil {
+			return err
+		}
+	}
+	if w.postCsw != nil {
+		if err := w.postCsw.UpdatePostAccountData(address, original, account); err != nil {
 			return err
 		}
 	}
@@ -125,6 +132,9 @@ func (w *PlainStateWriter) CreateContract(address common.Address) error {
 func (w *PlainStateWriter) WriteChangeSets() error {
 	if w.csw != nil {
 		return w.csw.WriteChangeSets()
+	}
+	if w.postCsw != nil {
+		return w.postCsw.WritePostChangeSets()
 	}
 
 	return nil

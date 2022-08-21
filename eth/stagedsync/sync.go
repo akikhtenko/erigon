@@ -217,6 +217,7 @@ func (s *Sync) Run(db kv.RwDB, tx kv.RwTx, firstCycle bool) error {
 			// we relax the rules for Stage1
 			firstCycle = false
 		}
+		firstCycle = false
 
 		stage := s.stages[s.currentStage]
 

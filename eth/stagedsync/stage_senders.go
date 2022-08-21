@@ -357,7 +357,7 @@ func UnwindSendersStage(s *UnwindState, tx kv.RwTx, cfg SendersCfg, ctx context.
 }
 
 func PruneSendersStage(s *PruneState, tx kv.RwTx, cfg SendersCfg, ctx context.Context) (err error) {
-	if !cfg.prune.TxIndex.Enabled() {
+	if true { //!cfg.prune.TxIndex.Enabled() {
 		return nil
 	}
 	logEvery := time.NewTicker(logInterval)

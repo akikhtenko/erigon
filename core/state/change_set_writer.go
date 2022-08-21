@@ -15,33 +15,45 @@ import (
 
 // ChangeSetWriter is a mock StateWriter that accumulates changes in-memory into ChangeSets.
 type ChangeSetWriter struct {
-	db             kv.RwTx
-	accountChanges map[common.Address][]byte
-	storageChanged map[common.Address]bool
-	storageChanges map[string][]byte
-	blockNumber    uint64
+	db                 kv.RwTx
+	accountChanges     map[common.Address][]byte
+	accountPostChanges map[common.Address][]byte
+	storageChanged     map[common.Address]bool
+	storageChanges     map[string][]byte
+	blockNumber        uint64
 }
 
 func NewChangeSetWriter() *ChangeSetWriter {
 	return &ChangeSetWriter{
-		accountChanges: make(map[common.Address][]byte),
-		storageChanged: make(map[common.Address]bool),
-		storageChanges: make(map[string][]byte),
+		accountChanges:     make(map[common.Address][]byte),
+		accountPostChanges: make(map[common.Address][]byte),
+		storageChanged:     make(map[common.Address]bool),
+		storageChanges:     make(map[string][]byte),
 	}
 }
 func NewChangeSetWriterPlain(db kv.RwTx, blockNumber uint64) *ChangeSetWriter {
 	return &ChangeSetWriter{
-		db:             db,
-		accountChanges: make(map[common.Address][]byte),
-		storageChanged: make(map[common.Address]bool),
-		storageChanges: make(map[string][]byte),
-		blockNumber:    blockNumber,
+		db:                 db,
+		accountChanges:     make(map[common.Address][]byte),
+		accountPostChanges: make(map[common.Address][]byte),
+		storageChanged:     make(map[common.Address]bool),
+		storageChanges:     make(map[string][]byte),
+		blockNumber:        blockNumber,
 	}
 }
 
 func (w *ChangeSetWriter) GetAccountChanges() (*changeset.ChangeSet, error) {
 	cs := changeset.NewAccountChangeSet()
 	for address, val := range w.accountChanges {
+		if err := cs.Add(common.CopyBytes(address[:]), val); err != nil {
+			return nil, err
+		}
+	}
+	return cs, nil
+}
+func (w *ChangeSetWriter) GetAccountPostChanges() (*changeset.ChangeSet, error) {
+	cs := changeset.NewAccountChangeSet()
+	for address, val := range w.accountPostChanges {
 		if err := cs.Add(common.CopyBytes(address[:]), val); err != nil {
 			return nil, err
 		}
@@ -86,7 +98,13 @@ func accountsEqual(a1, a2 *accounts.Account) bool {
 func (w *ChangeSetWriter) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
 	if !accountsEqual(original, account) || w.storageChanged[address] {
 		w.accountChanges[address] = originalAccountData(original, true /*omitHashes*/)
+		w.UpdatePostAccountData(address, original, account)
 	}
+	return nil
+}
+
+func (w *ChangeSetWriter) UpdatePostAccountData(address common.Address, original, account *accounts.Account) error {
+	w.accountPostChanges[address] = originalAccountData(account, true /*omitHashes*/)
 	return nil
 }
 
@@ -116,6 +134,23 @@ func (w *ChangeSetWriter) CreateContract(address common.Address) error {
 	return nil
 }
 
+func (w *ChangeSetWriter) WritePostChangeSets() error {
+	accountPostChanges, err := w.GetAccountPostChanges()
+	if err != nil {
+		return err
+	}
+	if err = changeset.Mapper[kv.AccountChangeSet].Encode(w.blockNumber, accountPostChanges, func(k, v []byte) error {
+		if err = w.db.AppendDup(kv.AccountPostChangeSet, k, v); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 func (w *ChangeSetWriter) WriteChangeSets() error {
 	accountChanges, err := w.GetAccountChanges()
 	if err != nil {
@@ -129,6 +164,8 @@ func (w *ChangeSetWriter) WriteChangeSets() error {
 	}); err != nil {
 		return err
 	}
+
+	w.WritePostChangeSets()
 
 	storageChanges, err := w.GetStorageChanges()
 	if err != nil {
