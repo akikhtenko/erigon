@@ -2,21 +2,26 @@ package stagedsync
 
 import (
 	"fmt"
+	"sync/atomic"
 
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/erigon/turbo/services"
+	"github.com/ledgerwatch/log/v3"
+
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/consensus/misc"
 	"github.com/ledgerwatch/erigon/core"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/state"
+	"github.com/ledgerwatch/erigon/core/systemcontracts"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/vm"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 	"github.com/ledgerwatch/erigon/ethdb"
 	"github.com/ledgerwatch/erigon/params"
-	"github.com/ledgerwatch/log/v3"
+	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
 )
 
 type MiningExecCfg struct {
@@ -25,8 +30,10 @@ type MiningExecCfg struct {
 	notifier    ChainEventNotifier
 	chainConfig params.ChainConfig
 	engine      consensus.Engine
+	blockReader services.FullBlockReader
 	vmConfig    *vm.Config
 	tmpdir      string
+	interrupt   *int32
 }
 
 func StageMiningExecCfg(
@@ -37,6 +44,7 @@ func StageMiningExecCfg(
 	engine consensus.Engine,
 	vmConfig *vm.Config,
 	tmpdir string,
+	interrupt *int32,
 ) MiningExecCfg {
 	return MiningExecCfg{
 		db:          db,
@@ -44,13 +52,15 @@ func StageMiningExecCfg(
 		notifier:    notifier,
 		chainConfig: chainConfig,
 		engine:      engine,
+		blockReader: snapshotsync.NewBlockReader(),
 		vmConfig:    vmConfig,
 		tmpdir:      tmpdir,
+		interrupt:   interrupt,
 	}
 }
 
 // SpawnMiningExecStage
-//TODO:
+// TODO:
 // - resubmitAdjustCh - variable is not implemented
 func SpawnMiningExecStage(s *StageState, tx kv.RwTx, cfg MiningExecCfg, quit <-chan struct{}) error {
 	cfg.vmConfig.NoReceipts = false
@@ -66,6 +76,7 @@ func SpawnMiningExecStage(s *StageState, tx kv.RwTx, cfg MiningExecCfg, quit <-c
 	if cfg.chainConfig.DAOForkSupport && cfg.chainConfig.DAOForkBlock != nil && cfg.chainConfig.DAOForkBlock.Cmp(current.Header.Number) == 0 {
 		misc.ApplyDAOHardFork(ibs)
 	}
+	systemcontracts.UpgradeBuildInSystemContract(&cfg.chainConfig, current.Header.Number, ibs)
 
 	// Create an empty block based on temporary copied state for
 	// sealing in advance without waiting block execution finished.
@@ -82,7 +93,7 @@ func SpawnMiningExecStage(s *StageState, tx kv.RwTx, cfg MiningExecCfg, quit <-c
 	// empty block is necessary to keep the liveness of the network.
 	if noempty {
 		if !localTxs.Empty() {
-			logs, err := addTransactionsToMiningBlock(logPrefix, current, cfg.chainConfig, cfg.vmConfig, getHeader, contractHasTEVM, cfg.engine, localTxs, cfg.miningState.MiningConfig.Etherbase, ibs, quit)
+			logs, err := addTransactionsToMiningBlock(logPrefix, current, cfg.chainConfig, cfg.vmConfig, getHeader, contractHasTEVM, cfg.engine, localTxs, cfg.miningState.MiningConfig.Etherbase, ibs, quit, cfg.interrupt)
 			if err != nil {
 				return err
 			}
@@ -94,7 +105,7 @@ func SpawnMiningExecStage(s *StageState, tx kv.RwTx, cfg MiningExecCfg, quit <-c
 			//}
 		}
 		if !remoteTxs.Empty() {
-			logs, err := addTransactionsToMiningBlock(logPrefix, current, cfg.chainConfig, cfg.vmConfig, getHeader, contractHasTEVM, cfg.engine, remoteTxs, cfg.miningState.MiningConfig.Etherbase, ibs, quit)
+			logs, err := addTransactionsToMiningBlock(logPrefix, current, cfg.chainConfig, cfg.vmConfig, getHeader, contractHasTEVM, cfg.engine, remoteTxs, cfg.miningState.MiningConfig.Etherbase, ibs, quit, cfg.interrupt)
 			if err != nil {
 				return err
 			}
@@ -107,7 +118,19 @@ func SpawnMiningExecStage(s *StageState, tx kv.RwTx, cfg MiningExecCfg, quit <-c
 		}
 	}
 
-	if err := core.FinalizeBlockExecution(cfg.engine, stateReader, current.Header, current.Txs, current.Uncles, stateWriter, &cfg.chainConfig, ibs, nil, nil, nil, nil); err != nil {
+	if current.Uncles == nil {
+		current.Uncles = []*types.Header{}
+	}
+	if current.Txs == nil {
+		current.Txs = []types.Transaction{}
+	}
+	if current.Receipts == nil {
+		current.Receipts = types.Receipts{}
+	}
+
+	_, err := core.FinalizeBlockExecution(cfg.engine, stateReader, current.Header, current.Txs, current.Uncles, stateWriter,
+		&cfg.chainConfig, ibs, current.Receipts, epochReader{tx: tx}, chainReader{config: &cfg.chainConfig, tx: tx, blockReader: cfg.blockReader}, true)
+	if err != nil {
 		return err
 	}
 
@@ -146,7 +169,7 @@ func SpawnMiningExecStage(s *StageState, tx kv.RwTx, cfg MiningExecCfg, quit <-c
 	return nil
 }
 
-func addTransactionsToMiningBlock(logPrefix string, current *MiningBlock, chainConfig params.ChainConfig, vmConfig *vm.Config, getHeader func(hash common.Hash, number uint64) *types.Header, contractHasTEVM func(common.Hash) (bool, error), engine consensus.Engine, txs types.TransactionsStream, coinbase common.Address, ibs *state.IntraBlockState, quit <-chan struct{}) (types.Logs, error) {
+func addTransactionsToMiningBlock(logPrefix string, current *MiningBlock, chainConfig params.ChainConfig, vmConfig *vm.Config, getHeader func(hash common.Hash, number uint64) *types.Header, contractHasTEVM func(common.Hash) (bool, error), engine consensus.Engine, txs types.TransactionsStream, coinbase common.Address, ibs *state.IntraBlockState, quit <-chan struct{}, interrupt *int32) (types.Logs, error) {
 	header := current.Header
 	tcount := 0
 	gasPool := new(core.GasPool).AddGas(current.Header.GasLimit)
@@ -157,7 +180,7 @@ func addTransactionsToMiningBlock(logPrefix string, current *MiningBlock, chainC
 
 	var miningCommitTx = func(txn types.Transaction, coinbase common.Address, vmConfig *vm.Config, chainConfig params.ChainConfig, ibs *state.IntraBlockState, current *MiningBlock) ([]*types.Log, error) {
 		snap := ibs.Snapshot()
-		receipt, _, err := core.ApplyTransaction(&chainConfig, getHeader, engine, &coinbase, gasPool, ibs, noop, header, txn, &header.GasUsed, *vmConfig, contractHasTEVM)
+		receipt, _, err := core.ApplyTransaction(&chainConfig, core.GetHashFn(header, getHeader), engine, &coinbase, gasPool, ibs, noop, header, txn, &header.GasUsed, *vmConfig, contractHasTEVM)
 		if err != nil {
 			ibs.RevertToSnapshot(snap)
 			return nil, err
@@ -178,26 +201,10 @@ func addTransactionsToMiningBlock(logPrefix string, current *MiningBlock, chainC
 			return nil, err
 		}
 
-		// In the following three cases, we will interrupt the execution of the transaction.
-		// (1) new head block event arrival, the interrupt signal is 1
-		// (2) worker start or restart, the interrupt signal is 1
-		// (3) worker recreate the mining block with any newly arrived transactions, the interrupt signal is 2.
-		// For the first two cases, the semi-finished work will be discarded.
-		// For the third case, the semi-finished work will be submitted to the consensus engine.
-		//if interrupt != nil && atomic.LoadInt32(interrupt) != commitInterruptNone {
-		//	// Notify resubmit loop to increase resubmitting interval due to too frequent commits.
-		//	if atomic.LoadInt32(interrupt) == commitInterruptResubmit {
-		//		ratio := float64(header.GasLimit-w.env.gasPool.Gas()) / float64(header.GasLimit)
-		//		if ratio < 0.1 {
-		//			ratio = 0.1
-		//		}
-		//		w.resubmitAdjustCh <- &intervalAdjust{
-		//			ratio: ratio,
-		//			inc:   true,
-		//		}
-		//	}
-		//	return atomic.LoadInt32(interrupt) == commitInterruptNewHead
-		//}
+		if interrupt != nil && atomic.LoadInt32(interrupt) != 0 {
+			log.Debug("Transaction adding was interrupted")
+			break
+		}
 		// If we don't have enough gas for any further transactions then we're done
 		if gasPool.Gas() < params.TxGas {
 			log.Debug(fmt.Sprintf("[%s] Not enough gas for further transactions", logPrefix), "have", gasPool, "want", params.TxGas)
@@ -213,10 +220,10 @@ func addTransactionsToMiningBlock(logPrefix string, current *MiningBlock, chainC
 		//
 		// We use the eip155 signer regardless of the env hf.
 		from, _ := txn.Sender(*signer)
-		// Check whether the txn is replay protected. If we're not in the EIP155 hf
+		// Check whether the txn is replay protected. If we're not in the EIP155 (Spurious Dragon) hf
 		// phase, start ignoring the sender until we do.
-		if txn.Protected() && !chainConfig.IsEIP155(header.Number.Uint64()) {
-			log.Debug(fmt.Sprintf("[%s] Ignoring replay protected transaction", logPrefix), "hash", txn.Hash(), "eip155", chainConfig.EIP155Block)
+		if txn.Protected() && !chainConfig.IsSpuriousDragon(header.Number.Uint64()) {
+			log.Debug(fmt.Sprintf("[%s] Ignoring replay protected transaction", logPrefix), "hash", txn.Hash(), "eip155", chainConfig.SpuriousDragonBlock)
 
 			txs.Pop()
 			continue

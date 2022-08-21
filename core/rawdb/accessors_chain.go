@@ -20,19 +20,25 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"math"
 	"math/big"
 	"time"
 
+	common2 "github.com/ledgerwatch/erigon-lib/common"
+	libcommon "github.com/ledgerwatch/erigon-lib/common/cmp"
+	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/interfaces"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/dbutils"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
 	"github.com/ledgerwatch/erigon/ethdb/cbor"
 	"github.com/ledgerwatch/erigon/rlp"
+	"github.com/ledgerwatch/erigon/turbo/services"
 	"github.com/ledgerwatch/log/v3"
+	"golang.org/x/exp/slices"
 )
 
 // ReadCanonicalHash retrieves the hash assigned to a canonical block number.
@@ -55,12 +61,30 @@ func WriteCanonicalHash(db kv.Putter, hash common.Hash, number uint64) error {
 	return nil
 }
 
-// DeleteCanonicalHash removes the number to hash canonical mapping.
-func DeleteCanonicalHash(db kv.Deleter, number uint64) error {
-	if err := db.Delete(kv.HeaderCanonical, dbutils.EncodeBlockNumber(number), nil); err != nil {
-		return fmt.Errorf("failed to delete number to hash mapping: %w", err)
+// TruncateCanonicalHash removes all the number to hash canonical mapping from block number N
+func TruncateCanonicalHash(tx kv.RwTx, blockFrom uint64, deleteHeaders bool) error {
+	if err := tx.ForEach(kv.HeaderCanonical, dbutils.EncodeBlockNumber(blockFrom), func(k, v []byte) error {
+		if deleteHeaders {
+			deleteHeader(tx, common.BytesToHash(v), blockFrom)
+		}
+		return tx.Delete(kv.HeaderCanonical, k)
+	}); err != nil {
+		return fmt.Errorf("TruncateCanonicalHash: %w", err)
 	}
 	return nil
+}
+
+// IsCanonicalHash determines whether a header with the given hash is on the canonical chain.
+func IsCanonicalHash(db kv.Getter, hash common.Hash) (bool, error) {
+	number := ReadHeaderNumber(db, hash)
+	if number == nil {
+		return false, nil
+	}
+	canonicalHash, err := ReadCanonicalHash(db, *number)
+	if err != nil {
+		return false, err
+	}
+	return canonicalHash != (common.Hash{}) && canonicalHash == hash, nil
 }
 
 // ReadHeaderNumber returns the header number assigned to a hash.
@@ -81,18 +105,11 @@ func ReadHeaderNumber(db kv.Getter, hash common.Hash) *uint64 {
 }
 
 // WriteHeaderNumber stores the hash->number mapping.
-func WriteHeaderNumber(db kv.Putter, hash common.Hash, number uint64) {
-	enc := dbutils.EncodeBlockNumber(number)
-	if err := db.Put(kv.HeaderNumber, hash[:], enc); err != nil {
-		log.Crit("Failed to store hash to number mapping", "err", err)
+func WriteHeaderNumber(db kv.Putter, hash common.Hash, number uint64) error {
+	if err := db.Put(kv.HeaderNumber, hash[:], dbutils.EncodeBlockNumber(number)); err != nil {
+		return err
 	}
-}
-
-// DeleteHeaderNumber removes hash->number mapping.
-func DeleteHeaderNumber(db kv.Deleter, hash common.Hash) {
-	if err := db.Delete(kv.HeaderNumber, hash[:], nil); err != nil {
-		log.Crit("Failed to delete hash to number mapping", "err", err)
-	}
+	return nil
 }
 
 // ReadHeadHeaderHash retrieves the hash of the current canonical head header.
@@ -131,6 +148,76 @@ func ReadHeadBlockHash(db kv.Getter) common.Hash {
 func WriteHeadBlockHash(db kv.Putter, hash common.Hash) {
 	if err := db.Put(kv.HeadBlockKey, []byte(kv.HeadBlockKey), hash.Bytes()); err != nil {
 		log.Crit("Failed to store last block's hash", "err", err)
+	}
+}
+
+// DeleteHeaderNumber removes hash->number mapping.
+func DeleteHeaderNumber(db kv.Deleter, hash common.Hash) {
+	if err := db.Delete(kv.HeaderNumber, hash[:]); err != nil {
+		log.Crit("Failed to delete hash mapping", "err", err)
+	}
+}
+
+// ReadForkchoiceHead retrieves headBlockHash from the last Engine API forkChoiceUpdated.
+func ReadForkchoiceHead(db kv.Getter) common.Hash {
+	data, err := db.GetOne(kv.LastForkchoice, []byte("headBlockHash"))
+	if err != nil {
+		log.Error("ReadForkchoiceHead failed", "err", err)
+	}
+	if len(data) == 0 {
+		return common.Hash{}
+	}
+	return common.BytesToHash(data)
+}
+
+// WriteForkchoiceHead stores headBlockHash from the last Engine API forkChoiceUpdated.
+func WriteForkchoiceHead(db kv.Putter, hash common.Hash) {
+	if err := db.Put(kv.LastForkchoice, []byte("headBlockHash"), hash[:]); err != nil {
+		log.Crit("Failed to store head block hash", "err", err)
+	}
+}
+
+// ReadForkchoiceSafe retrieves safeBlockHash from the last Engine API forkChoiceUpdated.
+func ReadForkchoiceSafe(db kv.Getter) common.Hash {
+	data, err := db.GetOne(kv.LastForkchoice, []byte("safeBlockHash"))
+	if err != nil {
+		log.Error("ReadForkchoiceSafe failed", "err", err)
+		return common.Hash{}
+	}
+
+	if len(data) == 0 {
+		return common.Hash{}
+	}
+
+	return common.BytesToHash(data)
+}
+
+// WriteForkchoiceSafe stores safeBlockHash from the last Engine API forkChoiceUpdated.
+func WriteForkchoiceSafe(db kv.Putter, hash common.Hash) {
+	if err := db.Put(kv.LastForkchoice, []byte("safeBlockHash"), hash[:]); err != nil {
+		log.Crit("Failed to store safe block hash", "err", err)
+	}
+}
+
+// ReadForkchoiceFinalized retrieves finalizedBlockHash from the last Engine API forkChoiceUpdated.
+func ReadForkchoiceFinalized(db kv.Getter) common.Hash {
+	data, err := db.GetOne(kv.LastForkchoice, []byte("finalizedBlockHash"))
+	if err != nil {
+		log.Error("ReadForkchoiceFinalize failed", "err", err)
+		return common.Hash{}
+	}
+
+	if len(data) == 0 {
+		return common.Hash{}
+	}
+
+	return common.BytesToHash(data)
+}
+
+// WriteForkchoiceFinalized stores finalizedBlockHash from the last Engine API forkChoiceUpdated.
+func WriteForkchoiceFinalized(db kv.Putter, hash common.Hash) {
+	if err := db.Put(kv.LastForkchoice, []byte("finalizedBlockHash"), hash[:]); err != nil {
+		log.Crit("Failed to safe finalized block hash", "err", err)
 	}
 }
 
@@ -188,6 +275,18 @@ func ReadCurrentBlock(db kv.Tx) *types.Block {
 	return ReadBlock(db, headHash, *headNumber)
 }
 
+func ReadLastBlockSynced(db kv.Tx) (*types.Block, error) {
+	headNumber, err := stages.GetStageProgress(db, stages.Execution)
+	if err != nil {
+		return nil, err
+	}
+	headHash, err := ReadCanonicalHash(db, headNumber)
+	if err != nil {
+		return nil, err
+	}
+	return ReadBlock(db, headHash, headNumber), nil
+}
+
 func ReadHeadersByNumber(db kv.Tx, number uint64) ([]*types.Header, error) {
 	var res []*types.Header
 	c, err := db.Cursor(kv.Headers)
@@ -234,12 +333,12 @@ func WriteHeader(db kv.Putter, header *types.Header) {
 	}
 }
 
-// DeleteHeader removes all block header data associated with a hash.
-func DeleteHeader(db kv.Deleter, hash common.Hash, number uint64) {
-	if err := db.Delete(kv.Headers, dbutils.HeaderKey(number, hash), nil); err != nil {
+// deleteHeader - dangerous, use DeleteAncientBlocks/TruncateBlocks methods
+func deleteHeader(db kv.Deleter, hash common.Hash, number uint64) {
+	if err := db.Delete(kv.Headers, dbutils.HeaderKey(number, hash)); err != nil {
 		log.Crit("Failed to delete header", "err", err)
 	}
-	if err := db.Delete(kv.HeaderNumber, hash.Bytes(), nil); err != nil {
+	if err := db.Delete(kv.HeaderNumber, hash.Bytes()); err != nil {
 		log.Crit("Failed to delete hash to number mapping", "err", err)
 	}
 }
@@ -268,6 +367,32 @@ func ReadStorageBodyRLP(db kv.Getter, hash common.Hash, number uint64) rlp.RawVa
 		log.Error("ReadBodyRLP failed", "err", err)
 	}
 	return bodyRlp
+}
+
+func ReadStorageBody(db kv.Getter, hash common.Hash, number uint64) (types.BodyForStorage, error) {
+	bodyRlp, err := db.GetOne(kv.BlockBody, dbutils.BlockBodyKey(number, hash))
+	if err != nil {
+		log.Error("ReadBodyRLP failed", "err", err)
+	}
+	bodyForStorage := new(types.BodyForStorage)
+	if err := rlp.DecodeBytes(bodyRlp, bodyForStorage); err != nil {
+		return types.BodyForStorage{}, err
+	}
+	return *bodyForStorage, nil
+}
+
+func CanonicalTxnByID(db kv.Getter, id uint64) (types.Transaction, error) {
+	txIdKey := make([]byte, 8)
+	binary.BigEndian.PutUint64(txIdKey, id)
+	v, err := db.GetOne(kv.EthTx, txIdKey)
+	if err != nil {
+		return nil, err
+	}
+	txn, err := types.DecodeTransaction(rlp.NewStream(bytes.NewReader(v), uint64(len(v))))
+	if err != nil {
+		return nil, err
+	}
+	return txn, nil
 }
 
 func CanonicalTransactions(db kv.Getter, baseTxId uint64, amount uint32) ([]types.Transaction, error) {
@@ -308,7 +433,7 @@ func NonCanonicalTransactions(db kv.Getter, baseTxId uint64, amount uint32) ([]t
 	binary.BigEndian.PutUint64(txIdKey, baseTxId)
 	i := uint32(0)
 
-	if err := db.ForAmount(kv.EthTx, txIdKey, amount, func(k, v []byte) error {
+	if err := db.ForAmount(kv.NonCanonicalTxs, txIdKey, amount, func(k, v []byte) error {
 		var decodeErr error
 		reader.Reset(v)
 		stream.Reset(reader, 0)
@@ -345,16 +470,16 @@ func WriteTransactions(db kv.RwTx, txs []types.Transaction, baseTxId uint64) err
 	return nil
 }
 
-func WriteRawTransactions(db kv.StatelessWriteTx, txs [][]byte, baseTxId uint64) error {
+func WriteRawTransactions(tx kv.RwTx, txs [][]byte, baseTxId uint64) error {
 	txId := baseTxId
-	for _, tx := range txs {
+	for _, txn := range txs {
 		txIdKey := make([]byte, 8)
 		binary.BigEndian.PutUint64(txIdKey, txId)
-		txId++
 		// If next Append returns KeyExists error - it means you need to open transaction in App code before calling this func. Batch is also fine.
-		if err := db.Append(kv.EthTx, txIdKey, tx); err != nil {
-			return err
+		if err := tx.Append(kv.EthTx, txIdKey, txn); err != nil {
+			return fmt.Errorf("txId=%d, baseTxId=%d, %w", txId, baseTxId, err)
 		}
+		txId++
 	}
 	return nil
 }
@@ -389,7 +514,7 @@ func ReadBodyWithTransactions(db kv.Getter, hash common.Hash, number uint64) (*t
 	if canonicalHash == hash {
 		return ReadCanonicalBodyWithTransactions(db, hash, number), nil
 	}
-	return ReadNonCanonicalBodyWithTransactions(db, hash, number), nil
+	return NonCanonicalBodyWithTransactions(db, hash, number), nil
 }
 
 func ReadCanonicalBodyWithTransactions(db kv.Getter, hash common.Hash, number uint64) *types.Body {
@@ -399,20 +524,6 @@ func ReadCanonicalBodyWithTransactions(db kv.Getter, hash common.Hash, number ui
 	}
 	var err error
 	body.Transactions, err = CanonicalTransactions(db, baseTxId, txAmount)
-	if err != nil {
-		log.Error("failed ReadTransactionByHash", "hash", hash, "block", number, "err", err)
-		return nil
-	}
-	return body
-}
-
-func ReadNonCanonicalBodyWithTransactions(db kv.Getter, hash common.Hash, number uint64) *types.Body {
-	body, baseTxId, txAmount := ReadBody(db, hash, number)
-	if body == nil {
-		return nil
-	}
-	var err error
-	body.Transactions, err = NonCanonicalTransactions(db, baseTxId, txAmount)
 	if err != nil {
 		log.Error("failed ReadTransactionByHash", "hash", hash, "block", number, "err", err)
 		return nil
@@ -482,6 +593,22 @@ func ResetSequence(tx kv.RwTx, bucket string, newValue uint64) error {
 	return nil
 }
 
+func ReadBodyForStorageByKey(db kv.Getter, k []byte) (*types.BodyForStorage, error) {
+	bodyRlp, err := db.GetOne(kv.BlockBody, k)
+	if err != nil {
+		return nil, err
+	}
+	if len(bodyRlp) == 0 {
+		return nil, nil
+	}
+	bodyForStorage := new(types.BodyForStorage)
+	if err := rlp.DecodeBytes(bodyRlp, bodyForStorage); err != nil {
+		return nil, err
+	}
+
+	return bodyForStorage, nil
+}
+
 func ReadBody(db kv.Getter, hash common.Hash, number uint64) (*types.Body, uint64, uint32) {
 	data := ReadStorageBodyRLP(db, hash, number)
 	if len(data) == 0 {
@@ -495,7 +622,11 @@ func ReadBody(db kv.Getter, hash common.Hash, number uint64) (*types.Body, uint6
 	}
 	body := new(types.Body)
 	body.Uncles = bodyForStorage.Uncles
-	return body, bodyForStorage.BaseTxId, bodyForStorage.TxAmount
+
+	if bodyForStorage.TxAmount < 2 {
+		panic(fmt.Sprintf("block body hash too few txs amount: %d, %d", number, bodyForStorage.TxAmount))
+	}
+	return body, bodyForStorage.BaseTxId + 1, bodyForStorage.TxAmount - 2 // 1 system txn in the begining of block, and 1 at the end
 }
 
 func ReadSenders(db kv.Getter, hash common.Hash, number uint64) ([]common.Address, error) {
@@ -510,7 +641,7 @@ func ReadSenders(db kv.Getter, hash common.Hash, number uint64) ([]common.Addres
 	return senders, nil
 }
 
-func WriteRawBodyIfNotExists(db kv.StatelessRwTx, hash common.Hash, number uint64, body *types.RawBody) error {
+func WriteRawBodyIfNotExists(db kv.RwTx, hash common.Hash, number uint64, body *types.RawBody) error {
 	exists, err := db.Has(kv.BlockBody, dbutils.BlockBodyKey(number, hash))
 	if err != nil {
 		return err
@@ -521,21 +652,21 @@ func WriteRawBodyIfNotExists(db kv.StatelessRwTx, hash common.Hash, number uint6
 	return WriteRawBody(db, hash, number, body)
 }
 
-func WriteRawBody(db kv.StatelessRwTx, hash common.Hash, number uint64, body *types.RawBody) error {
-	baseTxId, err := db.IncrementSequence(kv.EthTx, uint64(len(body.Transactions)))
+func WriteRawBody(db kv.RwTx, hash common.Hash, number uint64, body *types.RawBody) error {
+	baseTxId, err := db.IncrementSequence(kv.EthTx, uint64(len(body.Transactions))+2)
 	if err != nil {
 		return err
 	}
 	data := types.BodyForStorage{
 		BaseTxId: baseTxId,
-		TxAmount: uint32(len(body.Transactions)),
+		TxAmount: uint32(len(body.Transactions)) + 2,
 		Uncles:   body.Uncles,
 	}
 	if err = WriteBodyForStorage(db, hash, number, &data); err != nil {
-		return fmt.Errorf("failed to write body: %w", err)
+		return fmt.Errorf("WriteBodyForStorage: %w", err)
 	}
-	if err = WriteRawTransactions(db, body.Transactions, baseTxId); err != nil {
-		return fmt.Errorf("failed to WriteRawTransactions: %w", err)
+	if err = WriteRawTransactions(db, body.Transactions, baseTxId+1); err != nil {
+		return fmt.Errorf("WriteRawTransactions: %w", err)
 	}
 	return nil
 }
@@ -543,19 +674,19 @@ func WriteRawBody(db kv.StatelessRwTx, hash common.Hash, number uint64, body *ty
 func WriteBody(db kv.RwTx, hash common.Hash, number uint64, body *types.Body) error {
 	// Pre-processing
 	body.SendersFromTxs()
-	baseTxId, err := db.IncrementSequence(kv.EthTx, uint64(len(body.Transactions)))
+	baseTxId, err := db.IncrementSequence(kv.EthTx, uint64(len(body.Transactions))+2)
 	if err != nil {
 		return err
 	}
 	data := types.BodyForStorage{
 		BaseTxId: baseTxId,
-		TxAmount: uint32(len(body.Transactions)),
+		TxAmount: uint32(len(body.Transactions)) + 2,
 		Uncles:   body.Uncles,
 	}
 	if err := WriteBodyForStorage(db, hash, number, &data); err != nil {
 		return fmt.Errorf("failed to write body: %w", err)
 	}
-	err = WriteTransactions(db, body.Transactions, baseTxId)
+	err = WriteTransactions(db, body.Transactions, baseTxId+1)
 	if err != nil {
 		return fmt.Errorf("failed to WriteTransactions: %w", err)
 	}
@@ -573,15 +704,15 @@ func WriteSenders(db kv.Putter, hash common.Hash, number uint64, senders []commo
 	return nil
 }
 
-// DeleteBody removes all block body data associated with a hash.
-func DeleteBody(db kv.Deleter, hash common.Hash, number uint64) {
-	if err := db.Delete(kv.BlockBody, dbutils.BlockBodyKey(number, hash), nil); err != nil {
+// deleteBody removes all block body data associated with a hash.
+func deleteBody(db kv.Deleter, hash common.Hash, number uint64) {
+	if err := db.Delete(kv.BlockBody, dbutils.BlockBodyKey(number, hash)); err != nil {
 		log.Crit("Failed to delete block body", "err", err)
 	}
 }
 
 // MakeBodiesCanonical - move all txs of non-canonical blocks from NonCanonicalTxs table to EthTx table
-func MakeBodiesCanonical(tx kv.StatelessRwTx, from uint64, ctx context.Context, logPrefix string, logEvery *time.Ticker) error {
+func MakeBodiesCanonical(tx kv.RwTx, from uint64, ctx context.Context, logPrefix string, logEvery *time.Ticker) error {
 	for blockNum := from; ; blockNum++ {
 		h, err := ReadCanonicalHash(tx, blockNum)
 		if err != nil {
@@ -604,13 +735,18 @@ func MakeBodiesCanonical(tx kv.StatelessRwTx, from uint64, ctx context.Context, 
 			return err
 		}
 
-		id := newBaseId
-		if err := tx.ForAmount(kv.NonCanonicalTxs, dbutils.EncodeBlockNumber(bodyForStorage.BaseTxId), bodyForStorage.TxAmount, func(k, v []byte) error {
+		// next loop does move only non-system txs. need move system-txs manually (because they may not exist)
+		i := uint64(0)
+		if err := tx.ForAmount(kv.NonCanonicalTxs, dbutils.EncodeBlockNumber(bodyForStorage.BaseTxId+1), bodyForStorage.TxAmount-2, func(k, v []byte) error {
+			id := newBaseId + 1 + i
 			if err := tx.Put(kv.EthTx, dbutils.EncodeBlockNumber(id), v); err != nil {
 				return err
 			}
-			id++
-			return tx.Delete(kv.NonCanonicalTxs, k, nil)
+			if err := tx.Delete(kv.NonCanonicalTxs, k); err != nil {
+				return err
+			}
+			i++
+			return nil
 		}); err != nil {
 			return err
 		}
@@ -632,7 +768,9 @@ func MakeBodiesCanonical(tx kv.StatelessRwTx, from uint64, ctx context.Context, 
 }
 
 // MakeBodiesNonCanonical - move all txs of canonical blocks to NonCanonicalTxs bucket
-func MakeBodiesNonCanonical(tx kv.RwTx, from uint64, ctx context.Context, logPrefix string, logEvery *time.Ticker) error {
+func MakeBodiesNonCanonical(tx kv.RwTx, from uint64, deleteBodies bool, ctx context.Context, logPrefix string, logEvery *time.Ticker) error {
+	var firstMovedTxnID uint64
+	var firstMovedTxnIDIsSet bool
 	for blockNum := from; ; blockNum++ {
 		h, err := ReadCanonicalHash(tx, blockNum)
 		if err != nil {
@@ -650,26 +788,44 @@ func MakeBodiesNonCanonical(tx kv.RwTx, from uint64, ctx context.Context, logPre
 		if err := rlp.DecodeBytes(data, bodyForStorage); err != nil {
 			return err
 		}
-
-		// move txs to NonCanonical bucket, it has own sequence
-		newBaseId, err := tx.IncrementSequence(kv.NonCanonicalTxs, uint64(bodyForStorage.TxAmount))
-		if err != nil {
-			return err
+		if !firstMovedTxnIDIsSet {
+			firstMovedTxnIDIsSet = true
+			firstMovedTxnID = bodyForStorage.BaseTxId
 		}
-		id := newBaseId
-		if err := tx.ForAmount(kv.EthTx, dbutils.EncodeBlockNumber(bodyForStorage.BaseTxId), bodyForStorage.TxAmount, func(k, v []byte) error {
-			if err := tx.Put(kv.NonCanonicalTxs, dbutils.EncodeBlockNumber(id), v); err != nil {
+
+		newBaseId := uint64(0)
+		if !deleteBodies {
+			// move txs to NonCanonical bucket, it has own sequence
+			newBaseId, err = tx.IncrementSequence(kv.NonCanonicalTxs, uint64(bodyForStorage.TxAmount))
+			if err != nil {
 				return err
 			}
-			id++
-			return tx.Delete(kv.EthTx, k, nil)
+		}
+		// next loop does move only non-system txs. need move system-txs manually (because they may not exist)
+		i := uint64(0)
+		if err := tx.ForAmount(kv.EthTx, dbutils.EncodeBlockNumber(bodyForStorage.BaseTxId+1), bodyForStorage.TxAmount-2, func(k, v []byte) error {
+			if !deleteBodies {
+				id := newBaseId + 1 + i
+				if err := tx.Put(kv.NonCanonicalTxs, dbutils.EncodeBlockNumber(id), v); err != nil {
+					return err
+				}
+			}
+			if err := tx.Delete(kv.EthTx, k); err != nil {
+				return err
+			}
+			i++
+			return nil
 		}); err != nil {
 			return err
 		}
 
-		bodyForStorage.BaseTxId = newBaseId
-		if err := WriteBodyForStorage(tx, h, blockNum, bodyForStorage); err != nil {
-			return err
+		if deleteBodies {
+			deleteBody(tx, h, blockNum)
+		} else {
+			bodyForStorage.BaseTxId = newBaseId
+			if err := WriteBodyForStorage(tx, h, blockNum, bodyForStorage); err != nil {
+				return err
+			}
 		}
 
 		select {
@@ -682,23 +838,23 @@ func MakeBodiesNonCanonical(tx kv.RwTx, from uint64, ctx context.Context, logPre
 	}
 
 	// EthTx must have canonical id's - means need decrement it's sequence on unwind
-	c, err := tx.Cursor(kv.EthTx)
-	if err != nil {
-		return err
-	}
-	defer c.Close()
-	k, _, err := c.Last()
-	if err != nil {
-		return err
-	}
-	var nextTxID uint64
-	if k != nil {
-		nextTxID = binary.BigEndian.Uint64(k) + 1
-	}
-	if err := ResetSequence(tx, kv.EthTx, nextTxID); err != nil {
-		return err
-	}
+	if firstMovedTxnIDIsSet {
+		c, err := tx.Cursor(kv.EthTx)
+		if err != nil {
+			return err
+		}
+		k, _, err := c.Last()
+		if err != nil {
+			return err
+		}
+		if k != nil && binary.BigEndian.Uint64(k) >= firstMovedTxnID {
+			panic(fmt.Sprintf("must not happen, ResetSequence: %d, lastInDB: %d", firstMovedTxnID, binary.BigEndian.Uint64(k)))
+		}
 
+		if err := ResetSequence(tx, kv.EthTx, firstMovedTxnID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -738,10 +894,12 @@ func WriteTd(db kv.Putter, hash common.Hash, number uint64, td *big.Int) error {
 	return nil
 }
 
-// DeleteTd removes all block total difficulty data associated with a hash.
-func DeleteTd(db kv.Deleter, hash common.Hash, number uint64) error {
-	if err := db.Delete(kv.HeaderTD, dbutils.HeaderKey(number, hash), nil); err != nil {
-		return fmt.Errorf("failed to delete block total difficulty: %w", err)
+// TruncateTd removes all block total difficulty from block number N
+func TruncateTd(tx kv.RwTx, blockFrom uint64) error {
+	if err := tx.ForEach(kv.HeaderTD, dbutils.EncodeBlockNumber(blockFrom), func(k, _ []byte) error {
+		return tx.Delete(kv.HeaderTD, k)
+	}); err != nil {
+		return fmt.Errorf("TruncateTd: %w", err)
 	}
 	return nil
 }
@@ -807,9 +965,11 @@ func ReadReceipts(db kv.Tx, block *types.Block, senders []common.Address) types.
 	if receipts == nil {
 		return nil
 	}
-	block.SendersToTxs(senders)
+	if len(senders) > 0 {
+		block.SendersToTxs(senders)
+	}
 	if err := receipts.DeriveFields(block.Hash(), block.NumberU64(), block.Transactions(), senders); err != nil {
-		log.Error("Failed to derive block receipts fields", "hash", block.Hash(), "number", block.NumberU64(), "err", err)
+		log.Error("Failed to derive block receipts fields", "hash", block.Hash(), "number", block.NumberU64(), "err", err, "stack", dbg.Stack())
 		return nil
 	}
 	return receipts
@@ -870,7 +1030,7 @@ func WriteReceipts(tx kv.Putter, number uint64, receipts types.Receipts) error {
 }
 
 // AppendReceipts stores all the transaction receipts belonging to a block.
-func AppendReceipts(tx kv.RwTx, blockNumber uint64, receipts types.Receipts) error {
+func AppendReceipts(tx kv.StatelessWriteTx, blockNumber uint64, receipts types.Receipts) error {
 	buf := bytes.NewBuffer(make([]byte, 0, 1024))
 
 	for txId, r := range receipts {
@@ -901,34 +1061,18 @@ func AppendReceipts(tx kv.RwTx, blockNumber uint64, receipts types.Receipts) err
 	return nil
 }
 
-// DeleteReceipts removes all receipt data associated with a block hash.
-func DeleteReceipts(db kv.RwTx, number uint64) error {
-	if err := db.Delete(kv.Receipts, dbutils.EncodeBlockNumber(number), nil); err != nil {
-		return fmt.Errorf("receipts delete failed: %d, %w", number, err)
-	}
-
-	prefix := make([]byte, 8)
-	binary.BigEndian.PutUint64(prefix, number)
-	if err := db.ForPrefix(kv.Log, prefix, func(k, v []byte) error {
-		return db.Delete(kv.Log, k, nil)
-	}); err != nil {
-		return err
-	}
-	return nil
-}
-
-// DeleteNewerReceipts removes all receipt for given block number or newer
-func DeleteNewerReceipts(db kv.RwTx, number uint64) error {
-	if err := db.ForEach(kv.Receipts, dbutils.EncodeBlockNumber(number), func(k, v []byte) error {
-		return db.Delete(kv.Receipts, k, nil)
+// TruncateReceipts removes all receipt for given block number or newer
+func TruncateReceipts(db kv.RwTx, number uint64) error {
+	if err := db.ForEach(kv.Receipts, dbutils.EncodeBlockNumber(number), func(k, _ []byte) error {
+		return db.Delete(kv.Receipts, k)
 	}); err != nil {
 		return err
 	}
 
 	from := make([]byte, 8)
 	binary.BigEndian.PutUint64(from, number)
-	if err := db.ForEach(kv.Log, from, func(k, v []byte) error {
-		return db.Delete(kv.Log, k, nil)
+	if err := db.ForEach(kv.Log, from, func(k, _ []byte) error {
+		return db.Delete(kv.Log, k)
 	}); err != nil {
 		return err
 	}
@@ -974,7 +1118,7 @@ func NonCanonicalBlockWithSenders(tx kv.Getter, hash common.Hash, number uint64)
 	if header == nil {
 		return nil, nil, fmt.Errorf("header not found for block %d, %x", number, hash)
 	}
-	body := ReadCanonicalBodyWithTransactions(tx, hash, number)
+	body := NonCanonicalBodyWithTransactions(tx, hash, number)
 	if body == nil {
 		return nil, nil, fmt.Errorf("body not found for block %d, %x", number, hash)
 	}
@@ -1022,16 +1166,201 @@ func WriteBlock(db kv.RwTx, block *types.Block) error {
 	return nil
 }
 
-// DeleteBlock removes all block data associated with a hash.
-func DeleteBlock(db kv.RwTx, hash common.Hash, number uint64) error {
-	if err := DeleteReceipts(db, number); err != nil {
+// DeleteAncientBlocks - delete [1, to) old blocks after moving it to snapshots.
+// keeps genesis in db: [1, to)
+// doesn't change sequences of kv.EthTx and kv.NonCanonicalTxs
+// doesn't delete Receipts, Senders, Canonical markers, TotalDifficulty
+// returns [deletedFrom, deletedTo)
+func DeleteAncientBlocks(tx kv.RwTx, blockTo uint64, blocksDeleteLimit int) (deletedFrom, deletedTo uint64, err error) {
+	c, err := tx.Cursor(kv.Headers)
+	if err != nil {
+		return
+	}
+	defer c.Close()
+
+	// find first non-genesis block
+	firstK, _, err := c.Seek(dbutils.EncodeBlockNumber(1))
+	if err != nil {
+		return
+	}
+	if firstK == nil { //nothing to delete
+		return
+	}
+	blockFrom := binary.BigEndian.Uint64(firstK)
+	stopAtBlock := libcommon.Min(blockTo, blockFrom+uint64(blocksDeleteLimit))
+	k, _, _ := c.Current()
+	deletedFrom = binary.BigEndian.Uint64(k)
+
+	var canonicalHash common.Hash
+	var b *types.BodyForStorage
+
+	for k, _, err = c.Current(); k != nil; k, _, err = c.Next() {
+		if err != nil {
+			return
+		}
+
+		n := binary.BigEndian.Uint64(k)
+		if n >= stopAtBlock { // [from, to)
+			break
+		}
+
+		canonicalHash, err = ReadCanonicalHash(tx, n)
+		if err != nil {
+			return
+		}
+		isCanonical := bytes.Equal(k[8:], canonicalHash[:])
+
+		b, err = ReadBodyForStorageByKey(tx, k)
+		if err != nil {
+			return
+		}
+		if b == nil {
+			log.Debug("DeleteAncientBlocks: block body not found", "height", n)
+		} else {
+			txIDBytes := make([]byte, 8)
+			for txID := b.BaseTxId; txID < b.BaseTxId+uint64(b.TxAmount); txID++ {
+				binary.BigEndian.PutUint64(txIDBytes, txID)
+				bucket := kv.EthTx
+				if !isCanonical {
+					bucket = kv.NonCanonicalTxs
+				}
+				if err = tx.Delete(bucket, txIDBytes); err != nil {
+					return
+				}
+			}
+		}
+		// Copying k because otherwise the same memory will be reused
+		// for the next key and Delete below will end up deleting 1 more record than required
+		kCopy := common.CopyBytes(k)
+		if err = tx.Delete(kv.Headers, kCopy); err != nil {
+			return
+		}
+		if err = tx.Delete(kv.BlockBody, kCopy); err != nil {
+			return
+		}
+	}
+
+	k, _, _ = c.Current()
+	deletedTo = binary.BigEndian.Uint64(k)
+
+	return
+}
+
+// LastKey - candidate on move to kv.Tx interface
+func LastKey(tx kv.Tx, table string) ([]byte, error) {
+	c, err := tx.Cursor(table)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	k, _, err := c.Last()
+	if err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// FirstKey - candidate on move to kv.Tx interface
+func FirstKey(tx kv.Tx, table string) ([]byte, error) {
+	c, err := tx.Cursor(table)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	k, _, err := c.First()
+	if err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// SecondKey - useful if table always has zero-key (for example genesis block)
+func SecondKey(tx kv.Tx, table string) ([]byte, error) {
+	c, err := tx.Cursor(table)
+	if err != nil {
+		return nil, err
+	}
+	defer c.Close()
+	_, _, err = c.First()
+	if err != nil {
+		return nil, err
+	}
+	k, _, err := c.Next()
+	if err != nil {
+		return nil, err
+	}
+	return k, nil
+}
+
+// TruncateBlocks - delete block >= blockFrom
+// does decrement sequences of kv.EthTx and kv.NonCanonicalTxs
+// doesn't delete Receipts, Senders, Canonical markers, TotalDifficulty
+func TruncateBlocks(ctx context.Context, tx kv.RwTx, blockFrom uint64) error {
+	logEvery := time.NewTicker(20 * time.Second)
+	defer logEvery.Stop()
+
+	c, err := tx.Cursor(kv.Headers)
+	if err != nil {
 		return err
 	}
-	DeleteHeader(db, hash, number)
-	DeleteBody(db, hash, number)
-	if err := DeleteTd(db, hash, number); err != nil {
-		return err
+	defer c.Close()
+	if blockFrom < 1 { //protect genesis
+		blockFrom = 1
 	}
+	for k, _, err := c.Last(); k != nil; k, _, err = c.Prev() {
+		if err != nil {
+			return err
+		}
+		n := binary.BigEndian.Uint64(k)
+		if n < blockFrom { // [from, to)
+			break
+		}
+		canonicalHash, err := ReadCanonicalHash(tx, n)
+		if err != nil {
+			return err
+		}
+		isCanonical := bytes.Equal(k[8:], canonicalHash[:])
+
+		b, err := ReadBodyForStorageByKey(tx, k)
+		if err != nil {
+			return err
+		}
+		if b != nil {
+			bucket := kv.EthTx
+			if !isCanonical {
+				bucket = kv.NonCanonicalTxs
+			}
+			if err := tx.ForEach(bucket, dbutils.EncodeBlockNumber(b.BaseTxId), func(k, _ []byte) error {
+				if err := tx.Delete(bucket, k); err != nil {
+					return err
+				}
+				return nil
+			}); err != nil {
+				return err
+			}
+			if err := ResetSequence(tx, bucket, b.BaseTxId); err != nil {
+				return err
+			}
+		}
+		// Copying k because otherwise the same memory will be reused
+		// for the next key and Delete below will end up deleting 1 more record than required
+		kCopy := common.CopyBytes(k)
+		if err := tx.Delete(kv.Headers, kCopy); err != nil {
+			return err
+		}
+		if err := tx.Delete(kv.BlockBody, kCopy); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-logEvery.C:
+			log.Info("TruncateBlocks", "block", n)
+		default:
+		}
+	}
+
 	return nil
 }
 
@@ -1093,6 +1422,22 @@ func WriteTotalBurnt(db kv.Putter, number uint64, totalBurnt *big.Int) error {
 	return db.Put(kv.Issuance, append([]byte("burnt"), dbutils.EncodeBlockNumber(number)...), totalBurnt.Bytes())
 }
 
+func ReadCumulativeGasUsed(db kv.Getter, number uint64) (*big.Int, error) {
+	data, err := db.GetOne(kv.CumulativeGasIndex, dbutils.EncodeBlockNumber(number))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 {
+		return big.NewInt(0), nil
+	}
+
+	return new(big.Int).SetBytes(data), nil
+}
+
+func WriteCumulativeGasUsed(db kv.Putter, number uint64, cumulativeGasUsed *big.Int) error {
+	return db.Put(kv.CumulativeGasIndex, dbutils.EncodeBlockNumber(number), cumulativeGasUsed.Bytes())
+}
+
 func ReadHeaderByNumber(db kv.Getter, number uint64) *types.Header {
 	hash, err := ReadCanonicalHash(db, number)
 	if err != nil {
@@ -1114,7 +1459,7 @@ func ReadHeaderByHash(db kv.Getter, hash common.Hash) (*types.Header, error) {
 	return ReadHeader(db, hash, *number), nil
 }
 
-func ReadAncestor(db kv.Getter, hash common.Hash, number, ancestor uint64, maxNonCanonical *uint64, blockReader interfaces.HeaderAndCanonicalReader) (common.Hash, uint64) {
+func ReadAncestor(db kv.Getter, hash common.Hash, number, ancestor uint64, maxNonCanonical *uint64, blockReader services.HeaderAndCanonicalReader) (common.Hash, uint64) {
 	if ancestor > number {
 		return common.Hash{}, 0
 	}
@@ -1168,12 +1513,12 @@ func ReadAncestor(db kv.Getter, hash common.Hash, number, ancestor uint64, maxNo
 
 func DeleteNewerEpochs(tx kv.RwTx, number uint64) error {
 	if err := tx.ForEach(kv.PendingEpoch, dbutils.EncodeBlockNumber(number), func(k, v []byte) error {
-		return tx.Delete(kv.Epoch, k, nil)
+		return tx.Delete(kv.Epoch, k)
 	}); err != nil {
 		return err
 	}
 	return tx.ForEach(kv.Epoch, dbutils.EncodeBlockNumber(number), func(k, v []byte) error {
-		return tx.Delete(kv.Epoch, k, nil)
+		return tx.Delete(kv.Epoch, k)
 	})
 }
 func ReadEpoch(tx kv.Tx, blockNum uint64, blockHash common.Hash) (transitionProof []byte, err error) {
@@ -1254,4 +1599,128 @@ func Transitioned(db kv.Getter, blockNum uint64, terminalTotalDifficulty *big.In
 	}
 
 	return headerTd.Cmp(terminalTotalDifficulty) >= 0, nil
+}
+
+// IsPosBlock returns true if the block number comes after POS transition or is the last POW block
+func IsPosBlock(db kv.Getter, blockHash common.Hash) (trans bool, err error) {
+	header, err := ReadHeaderByHash(db, blockHash)
+	if err != nil {
+		return false, err
+	}
+	if header == nil {
+		return false, nil
+	}
+
+	return header.Difficulty.Cmp(common.Big0) == 0, nil
+}
+
+var SapshotsKey = []byte("snapshots")
+
+func ReadSnapshots(tx kv.Tx) ([]string, error) {
+	v, err := tx.GetOne(kv.DatabaseInfo, SapshotsKey)
+	if err != nil {
+		return nil, err
+	}
+	var res []string
+	_ = json.Unmarshal(v, &res)
+	return res, nil
+}
+
+func WriteSnapshots(tx kv.RwTx, list []string) error {
+	res, _ := json.Marshal(list)
+	return tx.Put(kv.DatabaseInfo, SapshotsKey, res)
+}
+
+// EnforceSnapshotsInvariant if DB has record - then file exists, if file exists - DB has record.
+func EnforceSnapshotsInvariant(tx kv.RwTx, snListInFolder []string) (filtered []string, err error) {
+	snList, err := ReadSnapshots(tx)
+	if err != nil {
+		return filtered, err
+	}
+	exists := map[string]string{}
+
+	for _, fName := range snListInFolder {
+		exists[fName] = ""
+	}
+
+	for _, fName := range snList {
+		if _, ok := exists[fName]; !ok {
+			delete(exists, fName)
+			continue
+		}
+		filtered = append(filtered, fName)
+		delete(exists, fName)
+	}
+	for fName := range exists {
+		filtered = append(filtered, fName)
+	}
+	slices.Sort(filtered)
+	if err = WriteSnapshots(tx, filtered); err != nil {
+		return filtered, err
+	}
+	return filtered, nil
+}
+
+// PruneTable has `limit` parameter to avoid too large data deletes per one sync cycle - better delete by small portions to reduce db.FreeList size
+func PruneTable(tx kv.RwTx, table string, pruneTo uint64, ctx context.Context, limit int) error {
+	c, err := tx.RwCursor(table)
+
+	if err != nil {
+		return fmt.Errorf("failed to create cursor for pruning %w", err)
+	}
+	defer c.Close()
+
+	i := 0
+	for k, _, err := c.First(); k != nil; k, _, err = c.Next() {
+		if err != nil {
+			return err
+		}
+		i++
+		if i > limit {
+			break
+		}
+
+		blockNum := binary.BigEndian.Uint64(k)
+		if blockNum >= pruneTo {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return common2.ErrStopped
+		default:
+		}
+		if err = c.DeleteCurrent(); err != nil {
+			return fmt.Errorf("failed to remove for block %d: %w", blockNum, err)
+		}
+	}
+	return nil
+}
+
+func PruneTableDupSort(tx kv.RwTx, table string, logPrefix string, pruneTo uint64, logEvery *time.Ticker, ctx context.Context) error {
+	c, err := tx.RwCursorDupSort(table)
+	if err != nil {
+		return fmt.Errorf("failed to create cursor for pruning %w", err)
+	}
+	defer c.Close()
+
+	for k, _, err := c.First(); k != nil; k, _, err = c.NextNoDup() {
+		if err != nil {
+			return fmt.Errorf("failed to move %s cleanup cursor: %w", table, err)
+		}
+		blockNum := binary.BigEndian.Uint64(k)
+		if blockNum >= pruneTo {
+			break
+		}
+		select {
+		case <-logEvery.C:
+			log.Info(fmt.Sprintf("[%s]", logPrefix), "table", table, "block", blockNum)
+		case <-ctx.Done():
+			return common2.ErrStopped
+		default:
+		}
+		if err = c.DeleteCurrentDuplicates(); err != nil {
+			return fmt.Errorf("failed to remove for block %d: %w", blockNum, err)
+		}
+	}
+	return nil
 }

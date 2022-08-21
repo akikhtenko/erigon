@@ -11,19 +11,31 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/core"
-	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/state"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/vm"
 	"github.com/ledgerwatch/erigon/internal/ethapi"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rpc"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
+	"github.com/ledgerwatch/erigon/turbo/services"
 	"github.com/ledgerwatch/log/v3"
 )
 
 const callTimeout = 5 * time.Minute
 
-func DoCall(ctx context.Context, args ethapi.CallArgs, tx kv.Tx, blockNrOrHash rpc.BlockNumberOrHash, block *types.Block, overrides *map[common.Address]ethapi.Account, gasCap uint64, chainConfig *params.ChainConfig, stateCache kvcache.Cache, contractHasTEVM func(hash common.Hash) (bool, error)) (*core.ExecutionResult, error) {
+func DoCall(
+	ctx context.Context,
+	args ethapi.CallArgs,
+	tx kv.Tx, blockNrOrHash rpc.BlockNumberOrHash,
+	block *types.Block, overrides *ethapi.StateOverrides,
+	gasCap uint64,
+	chainConfig *params.ChainConfig,
+	filters *rpchelper.Filters,
+	stateCache kvcache.Cache,
+	contractHasTEVM func(hash common.Hash) (bool, error),
+	headerReader services.HeaderReader,
+) (*core.ExecutionResult, error) {
 	// todo: Pending state is only known by the miner
 	/*
 		if blockNrOrHash.BlockNumber != nil && *blockNrOrHash.BlockNumber == rpc.PendingBlockNumber {
@@ -31,16 +43,9 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx kv.Tx, blockNrOrHash r
 			return state, block.Header(), nil
 		}
 	*/
-	blockNumber := block.NumberU64()
-	var stateReader state.StateReader
-	if num, ok := blockNrOrHash.Number(); ok && num == rpc.LatestBlockNumber {
-		cacheView, err := stateCache.View(ctx, tx)
-		if err != nil {
-			return nil, err
-		}
-		stateReader = state.NewCachedReader2(cacheView, tx)
-	} else {
-		stateReader = state.NewPlainState(tx, blockNumber)
+	stateReader, err := rpchelper.CreateStateReader(ctx, tx, blockNrOrHash, filters, stateCache)
+	if err != nil {
+		return nil, err
 	}
 	state := state.New(stateReader)
 
@@ -48,38 +53,10 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx kv.Tx, blockNrOrHash r
 
 	// Override the fields of specified contracts before execution.
 	if overrides != nil {
-		for addr, account := range *overrides {
-			// Override account nonce.
-			if account.Nonce != nil {
-				state.SetNonce(addr, uint64(*account.Nonce))
-			}
-			// Override account(contract) code.
-			if account.Code != nil {
-				state.SetCode(addr, *account.Code)
-			}
-			// Override account balance.
-			if account.Balance != nil {
-				balance, overflow := uint256.FromBig((*big.Int)(*account.Balance))
-				if overflow {
-					return nil, fmt.Errorf("account.Balance higher than 2^256-1")
-				}
-				state.SetBalance(addr, balance)
-			}
-			if account.State != nil && account.StateDiff != nil {
-				return nil, fmt.Errorf("account %s has both 'state' and 'stateDiff'", addr.Hex())
-			}
-			// Replace entire state if caller requires.
-			if account.State != nil {
-				state.SetStorage(addr, *account.State)
-			}
-			// Apply state diff into specified accounts.
-			if account.StateDiff != nil {
-				for key, value := range *account.StateDiff {
-					key := key
-					state.SetState(addr, &key, value)
-				}
-			}
+		if err := overrides.Override(state); err != nil {
+			return nil, err
 		}
+
 	}
 
 	// Setup context so it may be cancelled the call has completed
@@ -108,7 +85,7 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx kv.Tx, blockNrOrHash r
 	if err != nil {
 		return nil, err
 	}
-	blockCtx, txCtx := GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx, contractHasTEVM)
+	blockCtx, txCtx := GetEvmContext(msg, header, blockNrOrHash.RequireCanonical, tx, contractHasTEVM, headerReader)
 
 	evm := vm.NewEVM(blockCtx, txCtx, state, chainConfig, vm.Config{NoBaseFee: true})
 
@@ -132,7 +109,7 @@ func DoCall(ctx context.Context, args ethapi.CallArgs, tx kv.Tx, blockNrOrHash r
 	return result, nil
 }
 
-func GetEvmContext(msg core.Message, header *types.Header, requireCanonical bool, tx kv.Tx, contractHasTEVM func(address common.Hash) (bool, error)) (vm.BlockContext, vm.TxContext) {
+func GetEvmContext(msg core.Message, header *types.Header, requireCanonical bool, tx kv.Tx, contractHasTEVM func(address common.Hash) (bool, error), headerReader services.HeaderReader) (vm.BlockContext, vm.TxContext) {
 	var baseFee uint256.Int
 	if header.Eip1559 {
 		overflow := baseFee.SetFromBig(header.BaseFee)
@@ -143,7 +120,7 @@ func GetEvmContext(msg core.Message, header *types.Header, requireCanonical bool
 	return vm.BlockContext{
 			CanTransfer:     core.CanTransfer,
 			Transfer:        core.Transfer,
-			GetHash:         getHashGetter(requireCanonical, tx),
+			GetHash:         getHashGetter(requireCanonical, tx, headerReader),
 			ContractHasTEVM: contractHasTEVM,
 			Coinbase:        header.Coinbase,
 			BlockNumber:     header.Number.Uint64(),
@@ -158,12 +135,13 @@ func GetEvmContext(msg core.Message, header *types.Header, requireCanonical bool
 		}
 }
 
-func getHashGetter(requireCanonical bool, tx kv.Tx) func(uint64) common.Hash {
+func getHashGetter(requireCanonical bool, tx kv.Tx, headerReader services.HeaderReader) func(uint64) common.Hash {
 	return func(n uint64) common.Hash {
-		hash, err := rawdb.ReadCanonicalHash(tx, n)
+		h, err := headerReader.HeaderByNumber(context.Background(), tx, n)
 		if err != nil {
-			log.Debug("Can't get block hash by number", "number", n, "only-canonical", requireCanonical)
+			log.Error("Can't get block hash by number", "number", n, "only-canonical", requireCanonical)
+			return common.Hash{}
 		}
-		return hash
+		return h.Hash()
 	}
 }

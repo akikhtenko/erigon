@@ -91,7 +91,7 @@ type SimulatedBackend struct {
 func NewSimulatedBackendWithConfig(alloc core.GenesisAlloc, config *params.ChainConfig, gasLimit uint64) *SimulatedBackend {
 	genesis := core.Genesis{Config: config, GasLimit: gasLimit, Alloc: alloc}
 	engine := ethash.NewFaker()
-	m := stages.MockWithGenesisEngine(nil, &genesis, engine)
+	m := stages.MockWithGenesisEngine(nil, &genesis, engine, false)
 	backend := &SimulatedBackend{
 		m:            m,
 		prependBlock: m.Genesis,
@@ -137,7 +137,6 @@ func (b *SimulatedBackend) Commit() {
 	if err := b.m.InsertChain(&core.ChainPack{
 		Headers:  []*types.Header{b.pendingHeader},
 		Blocks:   []*types.Block{b.pendingBlock},
-		Length:   1,
 		TopBlock: b.pendingBlock,
 	}); err != nil {
 		panic(err)
@@ -173,9 +172,9 @@ func (b *SimulatedBackend) emptyPendingBlock() {
 // stateByBlockNumber retrieves a state by a given blocknumber.
 func (b *SimulatedBackend) stateByBlockNumber(db kv.Tx, blockNumber *big.Int) *state.IntraBlockState {
 	if blockNumber == nil || blockNumber.Cmp(b.pendingBlock.Number()) == 0 {
-		return state.New(state.NewPlainState(db, b.pendingBlock.NumberU64()))
+		return state.New(state.NewPlainState(db, b.pendingBlock.NumberU64()+1))
 	}
-	return state.New(state.NewPlainState(db, uint64(blockNumber.Int64())))
+	return state.New(state.NewPlainState(db, blockNumber.Uint64()+1))
 }
 
 // CodeAt returns the code associated with a certain account in the blockchain.
@@ -643,9 +642,16 @@ func (b *SimulatedBackend) EstimateGas(ctx context.Context, call ethereum.CallMs
 // callContract implements common code between normal and pending contract calls.
 // state is modified during execution, make sure to copy it if necessary.
 func (b *SimulatedBackend) callContract(_ context.Context, call ethereum.CallMsg, block *types.Block, statedb *state.IntraBlockState) (*core.ExecutionResult, error) {
+	const baseFeeUpperLimit = 880000000
 	// Ensure message is initialized properly.
 	if call.GasPrice == nil {
 		call.GasPrice = u256.Num1
+	}
+	if call.FeeCap == nil {
+		call.FeeCap = uint256.NewInt(baseFeeUpperLimit)
+	}
+	if call.Tip == nil {
+		call.Tip = uint256.NewInt(baseFeeUpperLimit)
 	}
 	if call.Gas == 0 {
 		call.Gas = 50000000
@@ -660,7 +666,8 @@ func (b *SimulatedBackend) callContract(_ context.Context, call ethereum.CallMsg
 	msg := callMsg{call}
 
 	txContext := core.NewEVMTxContext(msg)
-	evmContext := core.NewEVMBlockContext(block.Header(), b.getHeader, b.m.Engine, nil, b.contractHasTEVM)
+	header := block.Header()
+	evmContext := core.NewEVMBlockContext(header, core.GetHashFn(header, b.getHeader), b.m.Engine, nil, b.contractHasTEVM)
 	// Create a new environment which holds all relevant information
 	// about the transaction and calling mechanisms.
 	vmEnv := vm.NewEVM(evmContext, txContext, statedb, b.m.ChainConfig, vm.Config{})
@@ -689,7 +696,7 @@ func (b *SimulatedBackend) SendTransaction(ctx context.Context, tx types.Transac
 	b.pendingState.Prepare(tx.Hash(), common.Hash{}, len(b.pendingBlock.Transactions()))
 	//fmt.Printf("==== Start producing block %d, header: %d\n", b.pendingBlock.NumberU64(), b.pendingHeader.Number.Uint64())
 	if _, _, err := core.ApplyTransaction(
-		b.m.ChainConfig, b.getHeader, b.m.Engine,
+		b.m.ChainConfig, core.GetHashFn(b.pendingHeader, b.getHeader), b.m.Engine,
 		&b.pendingHeader.Coinbase, b.gasPool,
 		b.pendingState, state.NewNoopWriter(),
 		b.pendingHeader, tx,

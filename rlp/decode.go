@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ledgerwatch/log/v3"
+
 	"github.com/holiman/uint256"
 )
 
@@ -101,9 +103,12 @@ type Decoder interface {
 // Note that Decode does not set an input limit for all readers and may be vulnerable to
 // panics cause by huge value sizes. If you need an input limit, use
 //
-//     NewStream(r, limit).Decode(val)
+//	NewStream(r, limit).Decode(val)
 func Decode(r io.Reader, val interface{}) error {
-	stream := streamPool.Get().(*Stream)
+	stream, ok := streamPool.Get().(*Stream)
+	if !ok {
+		log.Warn("Failed to type convert to Stream pointer")
+	}
 	defer streamPool.Put(stream)
 
 	stream.Reset(r, 0)
@@ -115,7 +120,10 @@ func Decode(r io.Reader, val interface{}) error {
 func DecodeBytes(b []byte, val interface{}) error {
 	r := bytes.NewReader(b)
 
-	stream := streamPool.Get().(*Stream)
+	stream, ok := streamPool.Get().(*Stream)
+	if !ok {
+		log.Warn("Failed to type convert to Stream pointer")
+	}
 	defer streamPool.Put(stream)
 
 	stream.Reset(r, uint64(len(b)))
@@ -444,9 +452,16 @@ func makeStructDecoder(typ reflect.Type) (decoder, error) {
 		if _, err := s.List(); err != nil {
 			return wrapStreamError(err, typ)
 		}
-		for _, f := range fields {
+		for i, f := range fields {
 			err := f.info.decoder(s, val.Field(f.index))
 			if err == EOL {
+				if f.optional {
+					// The field is optional, so reaching the end of the list before
+					// reaching the last field is acceptable. All remaining undecoded
+					// fields are zeroed.
+					zeroFields(val, fields[i:])
+					break
+				}
 				return &decodeError{msg: "too few elements", typ: typ}
 			} else if err != nil {
 				return addErrorContext(err, "."+typ.Field(f.index).Name)
@@ -455,6 +470,13 @@ func makeStructDecoder(typ reflect.Type) (decoder, error) {
 		return wrapStreamError(s.ListEnd(), typ)
 	}
 	return dec, nil
+}
+
+func zeroFields(structval reflect.Value, fields []field) {
+	for _, f := range fields {
+		fv := structval.Field(f.index)
+		fv.Set(reflect.Zero(fv.Type()))
+	}
 }
 
 // makePtrDecoder creates a decoder that decodes into the pointer's element type.
@@ -1057,7 +1079,7 @@ func (s *Stream) readFull(buf []byte) (err error) {
 		nn, err = s.r.Read(buf[n:])
 		n += nn
 	}
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		if n < len(buf) {
 			err = io.ErrUnexpectedEOF
 		} else {
@@ -1074,7 +1096,7 @@ func (s *Stream) readByte() (byte, error) {
 		return 0, err
 	}
 	b, err := s.r.ReadByte()
-	if err == io.EOF {
+	if errors.Is(err, io.EOF) {
 		err = io.ErrUnexpectedEOF
 	}
 	return b, err

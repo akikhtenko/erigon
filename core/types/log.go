@@ -41,6 +41,8 @@ type Log struct {
 	// but not secured by consensus.
 	// block in which the transaction was included
 	BlockNumber uint64 `json:"blockNumber" codec:"-"`
+
+	Timestamp uint64 `json:"timestamp" codec:"-"`
 	// hash of the transaction
 	TxHash common.Hash `json:"transactionHash" gencodec:"required" codec:"-"`
 	// index of the transaction in the block
@@ -98,6 +100,30 @@ func (l *Log) DecodeRLP(s *rlp.Stream) error {
 		l.Address, l.Topics, l.Data = dec.Address, dec.Topics, dec.Data
 	}
 	return err
+}
+
+// Copy creates a deep copy of the Log.
+func (l *Log) Copy() *Log {
+	topics := make([]common.Hash, 0, len(l.Topics))
+	for _, topic := range l.Topics {
+		topicCopy := common.BytesToHash(topic.Bytes())
+		topics = append(topics, topicCopy)
+	}
+
+	data := make([]byte, len(l.Data))
+	copy(data, l.Data)
+
+	return &Log{
+		Address:     common.BytesToAddress(l.Address.Bytes()),
+		Topics:      topics,
+		Data:        data,
+		BlockNumber: l.BlockNumber,
+		TxHash:      common.BytesToHash(l.TxHash.Bytes()),
+		TxIndex:     l.TxIndex,
+		BlockHash:   common.BytesToHash(l.BlockHash.Bytes()),
+		Index:       l.Index,
+		Removed:     l.Removed,
+	}
 }
 
 // LogForStorage is a wrapper around a Log that flattens and parses the entire content of

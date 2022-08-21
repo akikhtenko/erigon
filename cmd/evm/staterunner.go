@@ -21,7 +21,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"os"
 
 	"github.com/ledgerwatch/erigon-lib/kv/memdb"
@@ -84,20 +83,39 @@ func stateTestCmd(ctx *cli.Context) error {
 		debugger = vm.NewStructLogger(config)
 	}
 	// Load the test content from the input file
-	src, err := ioutil.ReadFile(ctx.Args().First())
+	src, err := os.ReadFile(ctx.Args().First())
 	if err != nil {
 		return err
 	}
-	var tests map[string]tests.StateTest
-	if err = json.Unmarshal(src, &tests); err != nil {
+	var stateTests map[string]tests.StateTest
+	if err = json.Unmarshal(src, &stateTests); err != nil {
 		return err
 	}
-	// Iterate over all the tests, run them and aggregate the results
+
+	// Iterate over all the stateTests, run them and aggregate the results
+	results := make([]StatetestResult, 0, len(stateTests))
+	if err := aggregateResultsFromStateTests(ctx, stateTests, results, tracer, debugger); err != nil {
+		return err
+	}
+
+	out, _ := json.MarshalIndent(results, "", "  ")
+	fmt.Println(string(out))
+	return nil
+}
+
+func aggregateResultsFromStateTests(
+	ctx *cli.Context,
+	stateTests map[string]tests.StateTest,
+	results []StatetestResult,
+	tracer vm.Tracer,
+	debugger *vm.StructLogger,
+) error {
+	// Iterate over all the stateTests, run them and aggregate the results
 	cfg := vm.Config{
 		Tracer: tracer,
 		Debug:  ctx.GlobalBool(DebugFlag.Name) || ctx.GlobalBool(MachineFlag.Name),
 	}
-	results := make([]StatetestResult, 0, len(tests))
+
 	db := memdb.New()
 	defer db.Close()
 
@@ -107,7 +125,7 @@ func stateTestCmd(ctx *cli.Context) error {
 	}
 	defer tx.Rollback()
 
-	for key, test := range tests {
+	for key, test := range stateTests {
 		for _, st := range test.Subtests() {
 			// Run the test and aggregate the result
 			result := &StatetestResult{Name: key, Fork: st.Fork, Pass: true}
@@ -115,7 +133,7 @@ func stateTestCmd(ctx *cli.Context) error {
 			var root common.Hash
 			var calcRootErr error
 
-			statedb, err := test.Run(params.Rules{}, tx, st, cfg)
+			statedb, err := test.Run(&params.Rules{}, tx, st, cfg)
 			// print state root for evmlab tracing
 			root, calcRootErr = trie.CalcRoot("", tx)
 			if err == nil && calcRootErr != nil {
@@ -142,7 +160,10 @@ func stateTestCmd(ctx *cli.Context) error {
 
 			// print state root for evmlab tracing
 			if ctx.GlobalBool(MachineFlag.Name) && statedb != nil {
-				fmt.Fprintf(os.Stderr, "{\"stateRoot\": \"%x\"}\n", root.Bytes())
+				_, printErr := fmt.Fprintf(os.Stderr, "{\"stateRoot\": \"%x\"}\n", root.Bytes())
+				if printErr != nil {
+					log.Warn("Failed to write to stderr", "err", printErr)
+				}
 			}
 
 			results = append(results, *result)
@@ -150,13 +171,14 @@ func stateTestCmd(ctx *cli.Context) error {
 			// Print any structured logs collected
 			if ctx.GlobalBool(DebugFlag.Name) {
 				if debugger != nil {
-					fmt.Fprintln(os.Stderr, "#### TRACE ####")
+					_, printErr := fmt.Fprintln(os.Stderr, "#### TRACE ####")
+					if printErr != nil {
+						log.Warn("Failed to write to stderr", "err", printErr)
+					}
 					vm.WriteTrace(os.Stderr, debugger.StructLogs())
 				}
 			}
 		}
 	}
-	out, _ := json.MarshalIndent(results, "", "  ")
-	fmt.Println(string(out))
 	return nil
 }

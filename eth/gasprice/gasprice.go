@@ -117,7 +117,13 @@ func NewOracle(backend OracleBackend, params Config) *Oracle {
 // NODE: if caller wants legacy tx SuggestedPrice, we need to add
 // baseFee to the returned bigInt
 func (gpo *Oracle) SuggestTipCap(ctx context.Context) (*big.Int, error) {
-	head, _ := gpo.backend.HeaderByNumber(ctx, rpc.LatestBlockNumber)
+	head, err := gpo.backend.HeaderByNumber(ctx, rpc.LatestBlockNumber)
+	if err != nil {
+		return gpo.lastPrice, err
+	}
+	if head == nil {
+		return gpo.lastPrice, nil
+	}
 	headHash := head.Hash()
 
 	// If the latest gasprice is still available, return it.
@@ -192,7 +198,10 @@ func (t transactionsByGasPrice) Less(i, j int) bool {
 func (t *transactionsByGasPrice) Push(x interface{}) {
 	// Push and Pop use pointer receivers because they modify the slice's length,
 	// not just its contents.
-	l := x.(types.Transaction)
+	l, ok := x.(types.Transaction)
+	if !ok {
+		log.Error("Type assertion failure", "err", "cannot get types.Transaction from interface")
+	}
 	t.txs = append(t.txs, l)
 }
 
@@ -214,12 +223,12 @@ func (gpo *Oracle) getBlockPrices(ctx context.Context, blockNum uint64, limit in
 	ignoreUnder, overflow := uint256.FromBig(ingoreUnderBig)
 	if overflow {
 		err := errors.New("overflow in getBlockPrices, gasprice.go: ignoreUnder too large")
-		log.Error("gasprice.go: getBlockPrices", "error", err)
+		log.Error("gasprice.go: getBlockPrices", "err", err)
 		return err
 	}
 	block, err := gpo.backend.BlockByNumber(ctx, rpc.BlockNumber(blockNum))
 	if block == nil {
-		log.Error("gasprice.go: getBlockPrices", "error", err)
+		log.Error("gasprice.go: getBlockPrices", "err", err)
 		return err
 	}
 	blockTxs := block.Transactions()
@@ -232,7 +241,7 @@ func (gpo *Oracle) getBlockPrices(ctx context.Context, blockNum uint64, limit in
 		baseFee, overflow = uint256.FromBig(block.BaseFee())
 		if overflow {
 			err := errors.New("overflow in getBlockPrices, gasprice.go: baseFee > 2^256-1")
-			log.Error("gasprice.go: getBlockPrices", "error", err)
+			log.Error("gasprice.go: getBlockPrices", "err", err)
 			return err
 		}
 	}

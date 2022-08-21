@@ -1,11 +1,16 @@
-package services
+package services_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
-	"github.com/ledgerwatch/erigon/crypto"
 	"testing"
 	"testing/fstest"
+
+	"github.com/ledgerwatch/erigon-lib/kv/memdb"
+	"github.com/ledgerwatch/erigon/cmd/starknet/services"
+
+	"github.com/ledgerwatch/erigon/crypto"
 )
 
 func TestCreate(t *testing.T) {
@@ -14,11 +19,22 @@ func TestCreate(t *testing.T) {
 	var cases = []struct {
 		name       string
 		privateKey string
-		fileName   string
-		salt       string
+		config     *services.Config
 		want       string
+		error      error
 	}{
-		{name: "success", privateKey: privateKey, fileName: "contract_test.json", salt: "contract_address_salt", want: "03f87b83127ed8018080018001963762323236313632363932323361323035623564376495636f6e74726163745f616464726573735f73616c74c080a0ceb955e6039bf37dbf77e4452a10b4a47906bbbd2f6dcf0c15bccb052d3bbb60a03de24d584a0a20523f55a137ebc651e2b092fbc3728d67c9fda09da9f0edd154"},
+		{name: "invalid private key", privateKey: "abc", config: &services.Config{
+			ContractFileName: "not_exist.json",
+		}, error: services.ErrInvalidPrivateKey},
+		{name: "contract file not found", privateKey: generatePrivateKey(t), config: &services.Config{
+			ContractFileName: "not_exist.json",
+		}, error: services.ErrReadContract},
+		{name: "success", privateKey: privateKey, config: &services.Config{
+			ContractFileName: "contract_test.json",
+			Salt:             []byte("contract_address_salt"),
+			Gas:              1,
+			Nonce:            0,
+		}, want: "0xb88503f88283127ed801830186a084342770c0018001963762323236313632363932323361323035623564376495636f6e74726163745f616464726573735f73616c74c080a08b88467d0a9a6cba87ec6c2ad9e7399d12a1b6f7f5b951bdd2c5c2ea08b76134a0472e1b37ca5f87c9c38690718c6b2b9db1a3d5398dc664fc4e158ab60d02d64b"},
 	}
 
 	fs := fstest.MapFS{
@@ -27,46 +43,23 @@ func TestCreate(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			rawTxGenerator := RawTxGenerator{
-				privateKey: tt.privateKey,
-			}
+			rawTxGenerator := services.NewRawTxGenerator(tt.privateKey)
 
+			ctx := context.Background()
 			buf := bytes.NewBuffer(nil)
-			err := rawTxGenerator.CreateFromFS(fs, tt.fileName, []byte(tt.salt), buf)
-			assertNoError(t, err)
+			db := memdb.NewTestDB(t)
 
-			got := hex.EncodeToString(buf.Bytes())
+			err := rawTxGenerator.CreateFromFS(ctx, fs, db, tt.config, buf)
 
-			if got != tt.want {
-				t.Errorf("got %q not equals want %q", got, tt.want)
-			}
-		})
-	}
-}
+			if tt.error == nil {
+				assertNoError(t, err)
 
-func TestErrorCreate(t *testing.T) {
-	var cases = []struct {
-		name       string
-		privateKey string
-		fileName   string
-		error      error
-	}{
-		{name: "invalid private key", privateKey: "abc", fileName: "not_exist.json", error: ErrInvalidPrivateKey},
-		{name: "contract file not found", privateKey: generatePrivateKey(t), fileName: "not_exist.json", error: ErrReadContract},
-	}
+				got := buf.String()
 
-	for _, tt := range cases {
-		t.Run(tt.name, func(t *testing.T) {
-			fs := fstest.MapFS{}
-
-			rawTxGenerator := RawTxGenerator{
-				privateKey: tt.privateKey,
-			}
-
-			buf := bytes.NewBuffer(nil)
-			err := rawTxGenerator.CreateFromFS(fs, tt.fileName, []byte{}, buf)
-
-			if tt.error != nil {
+				if got != tt.want {
+					t.Errorf("got %q not equals want %q", got, tt.want)
+				}
+			} else {
 				assertError(t, err, tt.error)
 			}
 		})

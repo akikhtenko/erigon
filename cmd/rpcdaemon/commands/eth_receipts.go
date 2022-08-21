@@ -9,9 +9,9 @@ import (
 
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon-lib/kv"
+	"github.com/ledgerwatch/log/v3"
 
 	"github.com/RoaringBitmap/roaring"
-	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/dbutils"
 	"github.com/ledgerwatch/erigon/common/hexutil"
@@ -27,16 +27,21 @@ import (
 	"github.com/ledgerwatch/erigon/ethdb/cbor"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rpc"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/turbo/transactions"
 )
 
-func getReceipts(ctx context.Context, tx kv.Tx, chainConfig *params.ChainConfig, block *types.Block, senders []common.Address) (types.Receipts, error) {
+func (api *BaseAPI) getReceipts(ctx context.Context, tx kv.Tx, chainConfig *params.ChainConfig, block *types.Block, senders []common.Address) (types.Receipts, error) {
 	if cached := rawdb.ReadReceipts(tx, block, senders); cached != nil {
 		return cached, nil
 	}
 
 	getHeader := func(hash common.Hash, number uint64) *types.Header {
-		return rawdb.ReadHeader(tx, hash, number)
+		h, e := api._blockReader.Header(ctx, tx, hash, number)
+		if e != nil {
+			log.Error("getHeader error", "number", number, "hash", hash, "err", e)
+		}
+		return h
 	}
 	contractHasTEVM := ethdb.GetHasTEVM(tx)
 	_, _, _, ibs, _, err := transactions.ComputeTxEnv(ctx, block, chainConfig, getHeader, contractHasTEVM, ethash.NewFaker(), tx, block.Hash(), 0)
@@ -54,7 +59,8 @@ func getReceipts(ctx context.Context, tx kv.Tx, chainConfig *params.ChainConfig,
 
 	for i, txn := range block.Transactions() {
 		ibs.Prepare(txn.Hash(), block.Hash(), i)
-		receipt, _, err := core.ApplyTransaction(chainConfig, getHeader, ethashFaker, nil, gp, ibs, noopWriter, block.Header(), txn, usedGas, vm.Config{}, contractHasTEVM)
+		header := block.Header()
+		receipt, _, err := core.ApplyTransaction(chainConfig, core.GetHashFn(header, getHeader), ethashFaker, nil, gp, ibs, noopWriter, header, txn, usedGas, vm.Config{}, contractHasTEVM)
 		if err != nil {
 			return nil, err
 		}
@@ -68,24 +74,27 @@ func getReceipts(ctx context.Context, tx kv.Tx, chainConfig *params.ChainConfig,
 // GetLogs implements eth_getLogs. Returns an array of logs matching a given filter object.
 func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) ([]*types.Log, error) {
 	var begin, end uint64
-	var logs []*types.Log //nolint:prealloc
+	logs := []*types.Log{}
 
 	tx, beginErr := api.db.BeginRo(ctx)
 	if beginErr != nil {
-		return returnLogs(logs), beginErr
+		return logs, beginErr
 	}
 	defer tx.Rollback()
 
 	if crit.BlockHash != nil {
-		number := rawdb.ReadHeaderNumber(tx, *crit.BlockHash)
-		if number == nil {
+		header, err := api._blockReader.HeaderByHash(ctx, tx, *crit.BlockHash)
+		if err != nil {
+			return nil, err
+		}
+		if header == nil {
 			return nil, fmt.Errorf("block not found: %x", *crit.BlockHash)
 		}
-		begin = *number
-		end = *number
+		begin = header.Number.Uint64()
+		end = header.Number.Uint64()
 	} else {
 		// Convert the RPC block numbers into internal representations
-		latest, err := getLatestBlockNumber(tx)
+		latest, _, _, err := rpchelper.GetBlockNumber(rpc.BlockNumberOrHashWithNumber(rpc.LatestExecutedBlockNumber), tx, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -110,20 +119,26 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) ([
 	if end < begin {
 		return nil, fmt.Errorf("end (%d) < begin (%d)", end, begin)
 	}
+	if end > roaring.MaxUint32 {
+		latest, err := rpchelper.GetLatestBlockNumber(tx)
+		if err != nil {
+			return nil, err
+		}
+		if begin > latest {
+			return nil, fmt.Errorf("begin (%d) > latest (%d)", begin, latest)
+		}
+		end = latest
+	}
 
 	blockNumbers := roaring.New()
 	blockNumbers.AddRange(begin, end+1) // [min,max)
-
 	topicsBitmap, err := getTopicsBitmap(tx, crit.Topics, uint32(begin), uint32(end))
 	if err != nil {
 		return nil, err
 	}
+
 	if topicsBitmap != nil {
-		if blockNumbers == nil {
-			blockNumbers = topicsBitmap
-		} else {
-			blockNumbers.And(topicsBitmap)
-		}
+		blockNumbers.And(topicsBitmap)
 	}
 
 	var addrBitmap *roaring.Bitmap
@@ -134,33 +149,30 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) ([
 		}
 		if addrBitmap == nil {
 			addrBitmap = m
-		} else {
-			addrBitmap = roaring.Or(addrBitmap, m)
+			continue
 		}
+		addrBitmap = roaring.Or(addrBitmap, m)
 	}
 
 	if addrBitmap != nil {
-		if blockNumbers == nil {
-			blockNumbers = addrBitmap
-		} else {
-			blockNumbers.And(addrBitmap)
-		}
+		blockNumbers.And(addrBitmap)
 	}
 
 	if blockNumbers.GetCardinality() == 0 {
-		return returnLogs(logs), nil
+		return logs, nil
 	}
 
 	iter := blockNumbers.Iterator()
 	for iter.HasNext() {
-		if err = libcommon.Stopped(ctx.Done()); err != nil {
+		if err = ctx.Err(); err != nil {
 			return nil, err
 		}
 
-		blockNToMatch := uint64(iter.Next())
+		blockNumber := uint64(iter.Next())
 		var logIndex uint
-		var blockLogs types.Logs
-		if err := tx.ForPrefix(kv.Log, dbutils.EncodeBlockNumber(blockNToMatch), func(k, v []byte) error {
+		var txIndex uint
+		var blockLogs []*types.Log
+		err := tx.ForPrefix(kv.Log, dbutils.EncodeBlockNumber(blockNumber), func(k, v []byte) error {
 			var logs types.Logs
 			if err := cbor.Unmarshal(&logs, bytes.NewReader(v)); err != nil {
 				return fmt.Errorf("receipt unmarshal failed:  %w", err)
@@ -170,36 +182,45 @@ func (api *APIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria) ([
 				logIndex++
 			}
 			filtered := filterLogs(logs, crit.Addresses, crit.Topics)
-			if len(filtered) > 0 {
-				txIndex := uint(binary.BigEndian.Uint32(k[8:]))
-				for _, log := range filtered {
-					log.TxIndex = txIndex
-				}
-				blockLogs = append(blockLogs, filtered...)
+			if len(filtered) == 0 {
+				return nil
 			}
+			txIndex = uint(binary.BigEndian.Uint32(k[8:]))
+			for _, log := range filtered {
+				log.TxIndex = txIndex
+			}
+			blockLogs = append(blockLogs, filtered...)
+
 			return nil
-		}); err != nil {
-			return returnLogs(logs), err
+		})
+		if err != nil {
+			return logs, err
+		}
+		if len(blockLogs) == 0 {
+			continue
 		}
 
-		if len(blockLogs) > 0 {
-			b, err := api.blockByNumberWithSenders(tx, blockNToMatch)
-			if err != nil {
-				return nil, err
-			}
-			if b == nil {
-				return nil, fmt.Errorf("block not found %d", blockNToMatch)
-			}
-			blockHash := b.Hash()
-			for _, log := range blockLogs {
-				log.BlockNumber = blockNToMatch
-				log.BlockHash = blockHash
-				log.TxHash = b.Transactions()[log.TxIndex].Hash()
-			}
-			logs = append(logs, blockLogs...)
+		blockHash, err := rawdb.ReadCanonicalHash(tx, blockNumber)
+		if err != nil {
+			return nil, err
 		}
+
+		body, err := api._blockReader.BodyWithTransactions(ctx, tx, blockHash, blockNumber)
+		if err != nil {
+			return nil, err
+		}
+		if body == nil {
+			return nil, fmt.Errorf("block not found %d", blockNumber)
+		}
+		for _, log := range blockLogs {
+			log.BlockNumber = blockNumber
+			log.BlockHash = blockHash
+			log.TxHash = body.Transactions[log.TxIndex].Hash()
+		}
+		logs = append(logs, blockLogs...)
 	}
-	return returnLogs(logs), nil
+
+	return logs, nil
 }
 
 // The Topic list restricts matches to particular event topics. Each event has a list
@@ -224,37 +245,45 @@ func getTopicsBitmap(c kv.Tx, topics [][]common.Hash, from, to uint32) (*roaring
 			}
 			if bitmapForORing == nil {
 				bitmapForORing = m
-			} else {
-				bitmapForORing.Or(m)
+				continue
 			}
+			bitmapForORing.Or(m)
 		}
 
-		if bitmapForORing != nil {
-			if result == nil {
-				result = bitmapForORing
-			} else {
-				result = roaring.And(bitmapForORing, result)
-			}
+		if bitmapForORing == nil {
+			continue
 		}
+		if result == nil {
+			result = bitmapForORing
+			continue
+		}
+
+		result = roaring.And(bitmapForORing, result)
 	}
 	return result, nil
 }
 
 // GetTransactionReceipt implements eth_getTransactionReceipt. Returns the receipt of a transaction given the transaction's hash.
-func (api *APIImpl) GetTransactionReceipt(ctx context.Context, hash common.Hash) (map[string]interface{}, error) {
+func (api *APIImpl) GetTransactionReceipt(ctx context.Context, txnHash common.Hash) (map[string]interface{}, error) {
 	tx, err := api.db.BeginRo(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 
-	blockNum, ok, err := api.txnLookup(ctx, tx, hash)
+	var blockNum uint64
+	var ok bool
+
+	blockNum, ok, err = api.txnLookup(ctx, tx, txnHash)
+	if !ok || blockNum == 0 {
+		// It is not an ideal solution (ideal solution requires extending TxnLookupReply proto type to include bool flag indicating absense of result),
+		// but 0 block number is used here to mean that the transaction is not found
+		return nil, nil
+	}
 	if err != nil {
 		return nil, err
 	}
-	if !ok {
-		return nil, nil // not error, see https://github.com/ledgerwatch/erigon/issues/1645
-	}
+
 	block, err := api.blockByNumberWithSenders(tx, blockNum)
 	if err != nil {
 		return nil, err
@@ -262,34 +291,52 @@ func (api *APIImpl) GetTransactionReceipt(ctx context.Context, hash common.Hash)
 	if block == nil {
 		return nil, nil // not error, see https://github.com/ledgerwatch/erigon/issues/1645
 	}
-	var txnIndex uint64
-	var txn types.Transaction
-	for i, transaction := range block.Transactions() {
-		if transaction.Hash() == hash {
-			txn = transaction
-			txnIndex = uint64(i)
-			break
-		}
-	}
-	if txn == nil {
-		return nil, nil
-	}
 
 	cc, err := api.chainConfig(tx)
 	if err != nil {
 		return nil, err
 	}
-	receipts, err := getReceipts(ctx, tx, cc, block, block.Body().SendersFromTxs())
+	var txnIndex uint64
+	var txn types.Transaction
+	for idx, transaction := range block.Transactions() {
+		if transaction.Hash() == txnHash {
+			txn = transaction
+			txnIndex = uint64(idx)
+			break
+		}
+	}
+
+	if txn == nil {
+		if cc.Bor == nil {
+			return nil, nil
+		}
+
+		borTx, blockHash, _, _, err := rawdb.ReadBorTransactionForBlockNumber(tx, blockNum)
+		if err != nil {
+			return nil, err
+		}
+		if borTx == nil {
+			return nil, nil
+		}
+		borReceipt := rawdb.ReadBorReceipt(tx, blockHash, blockNum)
+		if borReceipt == nil {
+			return nil, nil
+		}
+		return marshalReceipt(borReceipt, borTx, cc, block, txnHash, false), nil
+	}
+
+	receipts, err := api.getReceipts(ctx, tx, cc, block, block.Body().SendersFromTxs())
 	if err != nil {
 		return nil, fmt.Errorf("getReceipts error: %w", err)
 	}
 	if len(receipts) <= int(txnIndex) {
 		return nil, fmt.Errorf("block has less receipts than expected: %d <= %d, block: %d", len(receipts), int(txnIndex), blockNum)
 	}
-	return marshalReceipt(receipts[txnIndex], block.Transactions()[txnIndex], cc, block), nil
+	return marshalReceipt(receipts[txnIndex], block.Transactions()[txnIndex], cc, block, txnHash, true), nil
 }
 
 // GetBlockReceipts - receipts for individual block
+// func (api *APIImpl) GetBlockReceipts(ctx context.Context, number rpc.BlockNumber) ([]map[string]interface{}, error) {
 func (api *APIImpl) GetBlockReceipts(ctx context.Context, number rpc.BlockNumber) ([]map[string]interface{}, error) {
 	tx, err := api.db.BeginRo(ctx)
 	if err != nil {
@@ -297,7 +344,7 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, number rpc.BlockNumber
 	}
 	defer tx.Rollback()
 
-	blockNum, err := getBlockNumber(number, tx)
+	blockNum, _, _, err := rpchelper.GetBlockNumber(rpc.BlockNumberOrHashWithNumber(number), tx, api.filters)
 	if err != nil {
 		return nil, err
 	}
@@ -312,20 +359,30 @@ func (api *APIImpl) GetBlockReceipts(ctx context.Context, number rpc.BlockNumber
 	if err != nil {
 		return nil, err
 	}
-	receipts, err := getReceipts(ctx, tx, chainConfig, block, block.Body().SendersFromTxs())
+	receipts, err := api.getReceipts(ctx, tx, chainConfig, block, block.Body().SendersFromTxs())
 	if err != nil {
 		return nil, fmt.Errorf("getReceipts error: %w", err)
 	}
 	result := make([]map[string]interface{}, 0, len(receipts))
 	for _, receipt := range receipts {
 		txn := block.Transactions()[receipt.TransactionIndex]
-		result = append(result, marshalReceipt(receipt, txn, chainConfig, block))
+		result = append(result, marshalReceipt(receipt, txn, chainConfig, block, txn.Hash(), true))
+	}
+
+	if chainConfig.Bor != nil {
+		borTx, _, _, _ := rawdb.ReadBorTransactionForBlock(tx, block)
+		if borTx != nil {
+			borReceipt := rawdb.ReadBorReceipt(tx, block.Hash(), blockNum)
+			if borReceipt != nil {
+				result = append(result, marshalReceipt(borReceipt, borTx, chainConfig, block, borReceipt.TxHash, false))
+			}
+		}
 	}
 
 	return result, nil
 }
 
-func marshalReceipt(receipt *types.Receipt, txn types.Transaction, chainConfig *params.ChainConfig, block *types.Block) map[string]interface{} {
+func marshalReceipt(receipt *types.Receipt, txn types.Transaction, chainConfig *params.ChainConfig, block *types.Block, txnHash common.Hash, signed bool) map[string]interface{} {
 	var chainId *big.Int
 	switch t := txn.(type) {
 	case *types.LegacyTx:
@@ -337,13 +394,17 @@ func marshalReceipt(receipt *types.Receipt, txn types.Transaction, chainConfig *
 	case *types.DynamicFeeTransaction:
 		chainId = t.ChainID.ToBig()
 	}
-	signer := types.LatestSignerForChainID(chainId)
-	from, _ := txn.Sender(*signer)
+
+	var from common.Address
+	if signed {
+		signer := types.LatestSignerForChainID(chainId)
+		from, _ = txn.Sender(*signer)
+	}
 
 	fields := map[string]interface{}{
 		"blockHash":         receipt.BlockHash,
 		"blockNumber":       hexutil.Uint64(receipt.BlockNumber.Uint64()),
-		"transactionHash":   txn.Hash(),
+		"transactionHash":   txnHash,
 		"transactionIndex":  hexutil.Uint64(receipt.TransactionIndex),
 		"from":              from,
 		"to":                txn.GetTo(),
@@ -386,7 +447,7 @@ func includes(addresses []common.Address, a common.Address) bool {
 
 // filterLogs creates a slice of logs matching the given criteria.
 func filterLogs(logs []*types.Log, addresses []common.Address, topics [][]common.Hash) []*types.Log {
-	var ret []*types.Log
+	result := make(types.Logs, 0, len(logs))
 Logs:
 	for _, log := range logs {
 
@@ -409,14 +470,7 @@ Logs:
 				continue Logs
 			}
 		}
-		ret = append(ret, log)
+		result = append(result, log)
 	}
-	return ret
-}
-
-func returnLogs(logs []*types.Log) []*types.Log {
-	if logs == nil {
-		return []*types.Log{}
-	}
-	return logs
+	return result
 }

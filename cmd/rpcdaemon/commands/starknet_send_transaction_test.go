@@ -2,19 +2,21 @@ package commands_test
 
 import (
 	"bytes"
+	"testing"
+
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon-lib/gointerfaces/starknet"
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/txpool"
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
 	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/commands"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/filters"
 	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/rpcdaemontest"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/hexutil"
 	"github.com/ledgerwatch/erigon/core/types"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
 	"github.com/ledgerwatch/erigon/turbo/stages"
 	"github.com/stretchr/testify/require"
-	"testing"
 )
 
 func TestErrorStarknetSendRawTransaction(t *testing.T) {
@@ -30,11 +32,12 @@ func TestErrorStarknetSendRawTransaction(t *testing.T) {
 	m, require := stages.MockWithTxPool(t), require.New(t)
 	ctx, conn := rpcdaemontest.CreateTestGrpcConn(t, m)
 	txPool := txpool.NewTxpoolClient(conn)
-	ff := filters.New(ctx, nil, txPool, txpool.NewMiningClient(conn))
+	starknetClient := starknet.NewCAIROVMClient(conn)
+	ff := rpchelper.New(ctx, nil, txPool, txpool.NewMiningClient(conn), func() {})
 	stateCache := kvcache.New(kvcache.DefaultCoherentConfig)
 
 	for _, tt := range cases {
-		api := commands.NewStarknetAPI(commands.NewBaseApi(ff, stateCache, snapshotsync.NewBlockReader(), false), m.DB, txPool)
+		api := commands.NewStarknetAPI(commands.NewBaseApi(ff, stateCache, snapshotsync.NewBlockReader(), nil, nil, false), m.DB, starknetClient, txPool)
 
 		t.Run(tt.name, func(t *testing.T) {
 			hex, _ := hexutil.Decode(tt.tx)

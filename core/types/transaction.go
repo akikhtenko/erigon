@@ -29,6 +29,7 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/crypto"
+	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rlp"
 )
 
@@ -61,14 +62,13 @@ type Transaction interface {
 	GetValue() *uint256.Int
 	Time() time.Time
 	GetTo() *common.Address
-	AsMessage(s Signer, baseFee *big.Int) (Message, error)
+	AsMessage(s Signer, baseFee *big.Int, rules *params.Rules) (Message, error)
 	WithSignature(signer Signer, sig []byte) (Transaction, error)
 	FakeSign(address common.Address) (Transaction, error)
 	Hash() common.Hash
 	SigningHash(chainID *big.Int) common.Hash
 	Size() common.StorageSize
 	GetData() []byte
-	GetSalt() []byte
 	GetAccessList() AccessList
 	Protected() bool
 	RawSignatureValues() (*uint256.Int, *uint256.Int, *uint256.Int)
@@ -98,13 +98,14 @@ type TransactionMisc struct {
 	from atomic.Value
 }
 
-type RawTransactions [][]byte
+// RLP-marshalled legacy transactions and binary-marshalled (not wrapped into an RLP string) typed (EIP-2718) transactions
+type BinaryTransactions [][]byte
 
-func (t RawTransactions) Len() int {
+func (t BinaryTransactions) Len() int {
 	return len(t)
 }
 
-func (t RawTransactions) EncodeIndex(i int, w *bytes.Buffer) {
+func (t BinaryTransactions) EncodeIndex(i int, w *bytes.Buffer) {
 	w.Write(t[i])
 }
 
@@ -204,6 +205,11 @@ func DecodeTransactions(txs [][]byte) ([]Transaction, error) {
 		}
 	}
 	return result, nil
+}
+
+func TypedTransactionMarshalledAsRlpString(data []byte) bool {
+	// Unless it's a single byte, serialized RLP strings have their first byte in the [0x80, 0xc0) range
+	return len(data) > 0 && 0x80 <= data[0] && data[0] < 0xc0
 }
 
 func sanityCheckSignature(v *uint256.Int, r *uint256.Int, s *uint256.Int, maybeProtected bool) error {

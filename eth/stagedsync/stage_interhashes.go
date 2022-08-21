@@ -5,38 +5,53 @@ import (
 	"context"
 	"fmt"
 	"math/bits"
-	"os"
-	"sort"
 
 	"github.com/ledgerwatch/erigon-lib/common/length"
 	"github.com/ledgerwatch/erigon-lib/etl"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/interfaces"
+	"github.com/ledgerwatch/erigon-lib/state"
+	"github.com/ledgerwatch/erigon/cmd/state/exec22"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/changeset"
 	"github.com/ledgerwatch/erigon/common/dbutils"
-	"github.com/ledgerwatch/erigon/core/rawdb"
+	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/core/types/accounts"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
+	"github.com/ledgerwatch/erigon/turbo/services"
+	"github.com/ledgerwatch/erigon/turbo/stages/headerdownload"
 	"github.com/ledgerwatch/erigon/turbo/trie"
 	"github.com/ledgerwatch/log/v3"
+	"golang.org/x/exp/slices"
 )
 
 type TrieCfg struct {
 	db                kv.RwDB
 	checkRoot         bool
+	badBlockHalt      bool
 	tmpDir            string
 	saveNewHashesToDB bool // no reason to save changes when calculating root for mining
-	blockReader       interfaces.FullBlockReader
+	blockReader       services.FullBlockReader
+	hd                *headerdownload.HeaderDownload
+
+	historyV2 bool
+	txNums    exec22.TxNums
+	agg       *state.Aggregator22
 }
 
-func StageTrieCfg(db kv.RwDB, checkRoot, saveNewHashesToDB bool, tmpDir string, blockReader interfaces.FullBlockReader) TrieCfg {
+func StageTrieCfg(db kv.RwDB, checkRoot, saveNewHashesToDB, badBlockHalt bool, tmpDir string, blockReader services.FullBlockReader, hd *headerdownload.HeaderDownload,
+	historyV2 bool, txNums exec22.TxNums, agg *state.Aggregator22) TrieCfg {
 	return TrieCfg{
 		db:                db,
 		checkRoot:         checkRoot,
 		tmpDir:            tmpDir,
 		saveNewHashesToDB: saveNewHashesToDB,
+		badBlockHalt:      badBlockHalt,
 		blockReader:       blockReader,
+		hd:                hd,
+
+		historyV2: historyV2,
+		txNums:    txNums,
+		agg:       agg,
 	}
 }
 
@@ -65,15 +80,14 @@ func SpawnIntermediateHashesStage(s *StageState, u Unwinder, tx kv.RwTx, cfg Tri
 
 	var expectedRootHash common.Hash
 	var headerHash common.Hash
+	var syncHeadHeader *types.Header
 	if cfg.checkRoot {
-		var hash common.Hash
-		hash, err = rawdb.ReadCanonicalHash(tx, to)
+		syncHeadHeader, err = cfg.blockReader.HeaderByNumber(ctx, tx, to)
 		if err != nil {
 			return trie.EmptyRoot, err
 		}
-		syncHeadHeader, err := cfg.blockReader.Header(ctx, tx, hash, to)
-		if err != nil {
-			return trie.EmptyRoot, err
+		if syncHeadHeader == nil {
+			return trie.EmptyRoot, fmt.Errorf("no header found with number %d", to)
 		}
 		expectedRootHash = syncHeadHeader.Root
 		headerHash = syncHeadHeader.Hash()
@@ -97,6 +111,12 @@ func SpawnIntermediateHashesStage(s *StageState, u Unwinder, tx kv.RwTx, cfg Tri
 	if err == nil {
 		if cfg.checkRoot && root != expectedRootHash {
 			log.Error(fmt.Sprintf("[%s] Wrong trie root of block %d: %x, expected (from header): %x. Block hash: %x", logPrefix, to, root, expectedRootHash, headerHash))
+			if cfg.badBlockHalt {
+				return trie.EmptyRoot, fmt.Errorf("wrong trie root")
+			}
+			if cfg.hd != nil {
+				cfg.hd.ReportBadHeaderPoS(headerHash, syncHeadHeader.ParentHash)
+			}
 			if to > s.BlockNumber {
 				unwindTo := (to + s.BlockNumber) / 2 // Binary search for the correct block, biased to the lower numbers
 				log.Warn("Unwinding due to incorrect root hash", "to", unwindTo)
@@ -156,22 +176,95 @@ func RegenerateIntermediateHashes(logPrefix string, db kv.RwTx, cfg TrieCfg, exp
 }
 
 type HashPromoter struct {
-	db               kv.RwTx
+	tx               kv.RwTx
 	ChangeSetBufSize uint64
 	TempDir          string
+	logPrefix        string
 	quitCh           <-chan struct{}
 }
 
-func NewHashPromoter(db kv.RwTx, quitCh <-chan struct{}) *HashPromoter {
+func NewHashPromoter(db kv.RwTx, tempDir string, quitCh <-chan struct{}, logPrefix string) *HashPromoter {
 	return &HashPromoter{
-		db:               db,
+		tx:               db,
 		ChangeSetBufSize: 256 * 1024 * 1024,
-		TempDir:          os.TempDir(),
+		TempDir:          tempDir,
 		quitCh:           quitCh,
+		logPrefix:        logPrefix,
 	}
 }
 
-func (p *HashPromoter) Promote(logPrefix string, s *StageState, from, to uint64, storage bool, load etl.LoadFunc) error {
+func (p *HashPromoter) PromoteOnHistoryV2(logPrefix string, txNums exec22.TxNums, agg *state.Aggregator22, from, to uint64, storage bool, load etl.LoadFunc) error {
+	if storage {
+		collector := etl.NewCollector(logPrefix, p.TempDir, etl.NewSortableBuffer(etl.BufferOptimalSize))
+		defer collector.Close()
+
+		it := agg.Storage().InvertedIndex.MakeContext().IterateChangedKeys(txNums.MinOf(from), txNums.MaxOf(to), p.tx)
+		defer it.Close()
+		for it.HasNext() {
+			k := it.Next(nil)
+
+			accBytes, err := p.tx.GetOne(kv.PlainState, k[:20])
+			if err != nil {
+				return err
+			}
+			if len(accBytes) == 0 {
+				return nil
+			}
+			incarnation, err := accounts.DecodeIncarnationFromStorage(accBytes)
+			if err != nil {
+				return err
+			}
+			if incarnation == 0 {
+				return nil
+			}
+			plainKey := dbutils.PlainGenerateCompositeStorageKey(k[:20], incarnation, k[20:])
+			newV, err := p.tx.GetOne(kv.PlainState, plainKey)
+			if err != nil {
+				return err
+			}
+			newK, err := transformPlainStateKey(plainKey)
+			if err != nil {
+				return err
+			}
+
+			if err := collector.Collect(newK, newV); err != nil {
+				return err
+			}
+		}
+		if err := collector.Load(nil, "", load, etl.TransformArgs{Quit: p.quitCh}); err != nil {
+			return err
+		}
+		return nil
+	}
+	collector := etl.NewCollector(logPrefix, p.TempDir, etl.NewSortableBuffer(etl.BufferOptimalSize))
+	defer collector.Close()
+
+	it := agg.Accounts().InvertedIndex.MakeContext().IterateChangedKeys(txNums.MinOf(from), txNums.MaxOf(to), p.tx)
+	defer it.Close()
+	for it.HasNext() {
+		k := it.Next(nil)
+
+		newK, err := transformPlainStateKey(k)
+		if err != nil {
+			return err
+		}
+		newValue, err := p.tx.GetOne(kv.PlainState, k)
+		if err != nil {
+			return err
+		}
+
+		if err := collector.Collect(newK, newValue); err != nil {
+			return err
+		}
+	}
+	if err := collector.Load(nil, "", load, etl.TransformArgs{Quit: p.quitCh}); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (p *HashPromoter) Promote(logPrefix string, from, to uint64, storage bool, load etl.LoadFunc) error {
 	var changeSetBucket string
 	if storage {
 		changeSetBucket = kv.StorageChangeSet
@@ -185,35 +278,41 @@ func (p *HashPromoter) Promote(logPrefix string, s *StageState, from, to uint64,
 	decode := changeset.Mapper[changeSetBucket].Decode
 	var deletedAccounts [][]byte
 	extract := func(dbKey, dbValue []byte, next etl.ExtractNextFunc) error {
-		_, k, v := decode(dbKey, dbValue)
+		_, k, v, err := decode(dbKey, dbValue)
+		if err != nil {
+			return err
+		}
 		newK, err := transformPlainStateKey(k)
 		if err != nil {
 			return err
 		}
-		if !storage {
-			newValue, err := p.db.GetOne(kv.PlainState, k)
-			if err != nil {
+		if !storage && len(v) > 0 {
+
+			var oldAccount accounts.Account
+			if err := oldAccount.DecodeForStorage(v); err != nil {
 				return err
 			}
-			if len(v) > 0 {
-				var oldAccount accounts.Account
-				if err := oldAccount.DecodeForStorage(v); err != nil {
+
+			if oldAccount.Incarnation > 0 {
+
+				newValue, err := p.tx.GetOne(kv.PlainState, k)
+				if err != nil {
 					return err
 				}
-				if oldAccount.Incarnation > 0 {
-					if len(newValue) == 0 { // self-destructed
+
+				if len(newValue) == 0 { // self-destructed
+					deletedAccounts = append(deletedAccounts, newK)
+				} else { // turns incarnation to zero
+					var newAccount accounts.Account
+					if err := newAccount.DecodeForStorage(newValue); err != nil {
+						return err
+					}
+					if newAccount.Incarnation < oldAccount.Incarnation {
 						deletedAccounts = append(deletedAccounts, newK)
-					} else { // turns incarnation to zero
-						var newAccount accounts.Account
-						if err := newAccount.DecodeForStorage(newValue); err != nil {
-							return err
-						}
-						if newAccount.Incarnation < oldAccount.Incarnation {
-							deletedAccounts = append(deletedAccounts, newK)
-						}
 					}
 				}
 			}
+
 		}
 
 		return next(dbKey, newK, v)
@@ -224,7 +323,7 @@ func (p *HashPromoter) Promote(logPrefix string, s *StageState, from, to uint64,
 
 	if err := etl.Transform(
 		logPrefix,
-		p.db,
+		p.tx,
 		changeSetBucket,
 		"",
 		p.TempDir,
@@ -240,10 +339,10 @@ func (p *HashPromoter) Promote(logPrefix string, s *StageState, from, to uint64,
 	}
 
 	if !storage { // delete Intermediate hashes of deleted accounts
-		sort.Slice(deletedAccounts, func(i, j int) bool { return bytes.Compare(deletedAccounts[i], deletedAccounts[j]) < 0 })
+		slices.SortFunc(deletedAccounts, func(a, b []byte) bool { return bytes.Compare(a, b) < 0 })
 		for _, k := range deletedAccounts {
-			if err := p.db.ForPrefix(kv.TrieOfStorage, k, func(k, v []byte) error {
-				if err := p.db.Delete(kv.TrieOfStorage, k, v); err != nil {
+			if err := p.tx.ForPrefix(kv.TrieOfStorage, k, func(k, v []byte) error {
+				if err := p.tx.Delete(kv.TrieOfStorage, k); err != nil {
 					return err
 				}
 				return nil
@@ -265,20 +364,23 @@ func (p *HashPromoter) Unwind(logPrefix string, s *StageState, u *UnwindState, s
 	} else {
 		changeSetBucket = kv.AccountChangeSet
 	}
-	log.Info(fmt.Sprintf("[%s] Unwinding of trie hashes", logPrefix), "from", s.BlockNumber, "to", to, "csbucket", changeSetBucket)
+	log.Info(fmt.Sprintf("[%s] Unwinding", logPrefix), "from", s.BlockNumber, "to", to, "csbucket", changeSetBucket)
 
 	startkey := dbutils.EncodeBlockNumber(to + 1)
 
 	decode := changeset.Mapper[changeSetBucket].Decode
 	var deletedAccounts [][]byte
 	extract := func(dbKey, dbValue []byte, next etl.ExtractNextFunc) error {
-		_, k, v := decode(dbKey, dbValue)
+		_, k, v, err := decode(dbKey, dbValue)
+		if err != nil {
+			return err
+		}
 		newK, err := transformPlainStateKey(k)
 		if err != nil {
 			return err
 		}
 		// Plain state not unwind yet, it means - if key not-exists in PlainState but has value from ChangeSets - then need mark it as "created" in RetainList
-		value, err := p.db.GetOne(kv.PlainState, k)
+		value, err := p.tx.GetOne(kv.PlainState, k)
 		if err != nil {
 			return err
 		}
@@ -310,7 +412,7 @@ func (p *HashPromoter) Unwind(logPrefix string, s *StageState, u *UnwindState, s
 
 	if err := etl.Transform(
 		logPrefix,
-		p.db,
+		p.tx,
 		changeSetBucket,
 		"",
 		p.TempDir,
@@ -326,10 +428,10 @@ func (p *HashPromoter) Unwind(logPrefix string, s *StageState, u *UnwindState, s
 	}
 
 	if !storage { // delete Intermediate hashes of deleted accounts
-		sort.Slice(deletedAccounts, func(i, j int) bool { return bytes.Compare(deletedAccounts[i], deletedAccounts[j]) < 0 })
+		slices.SortFunc(deletedAccounts, func(a, b []byte) bool { return bytes.Compare(a, b) < 0 })
 		for _, k := range deletedAccounts {
-			if err := p.db.ForPrefix(kv.TrieOfStorage, k, func(k, v []byte) error {
-				if err := p.db.Delete(kv.TrieOfStorage, k, v); err != nil {
+			if err := p.tx.ForPrefix(kv.TrieOfStorage, k, func(k, v []byte) error {
+				if err := p.tx.Delete(kv.TrieOfStorage, k); err != nil {
 					return err
 				}
 				return nil
@@ -344,20 +446,27 @@ func (p *HashPromoter) Unwind(logPrefix string, s *StageState, u *UnwindState, s
 }
 
 func incrementIntermediateHashes(logPrefix string, s *StageState, db kv.RwTx, to uint64, cfg TrieCfg, expectedRootHash common.Hash, quit <-chan struct{}) (common.Hash, error) {
-	p := NewHashPromoter(db, quit)
-	p.TempDir = cfg.tmpDir
+	p := NewHashPromoter(db, cfg.tmpDir, quit, logPrefix)
 	rl := trie.NewRetainList(0)
 	collect := func(k, v []byte, _ etl.CurrentTableReader, _ etl.LoadNextFunc) error {
 		rl.AddKeyWithMarker(k, len(v) == 0)
 		return nil
 	}
-	if err := p.Promote(logPrefix, s, s.BlockNumber, to, false /* storage */, collect); err != nil {
-		return trie.EmptyRoot, err
+	if cfg.historyV2 {
+		if err := p.PromoteOnHistoryV2(logPrefix, cfg.txNums, cfg.agg, s.BlockNumber, to, false, collect); err != nil {
+			return trie.EmptyRoot, err
+		}
+		if err := p.PromoteOnHistoryV2(logPrefix, cfg.txNums, cfg.agg, s.BlockNumber, to, true, collect); err != nil {
+			return trie.EmptyRoot, err
+		}
+	} else {
+		if err := p.Promote(logPrefix, s.BlockNumber, to, false, collect); err != nil {
+			return trie.EmptyRoot, err
+		}
+		if err := p.Promote(logPrefix, s.BlockNumber, to, true, collect); err != nil {
+			return trie.EmptyRoot, err
+		}
 	}
-	if err := p.Promote(logPrefix, s, s.BlockNumber, to, true /* storage */, collect); err != nil {
-		return trie.EmptyRoot, err
-	}
-
 	accTrieCollector := etl.NewCollector(logPrefix, cfg.tmpDir, etl.NewSortableBuffer(etl.BufferOptimalSize))
 	defer accTrieCollector.Close()
 	accTrieCollectorFunc := accountTrieCollector(accTrieCollector)
@@ -403,6 +512,9 @@ func UnwindIntermediateHashesStage(u *UnwindState, s *StageState, tx kv.RwTx, cf
 	if err != nil {
 		return err
 	}
+	if syncHeadHeader == nil {
+		return fmt.Errorf("header not found for block number %d", u.UnwindPoint)
+	}
 	expectedRootHash := syncHeadHeader.Root
 
 	logPrefix := s.LogPrefix()
@@ -421,8 +533,7 @@ func UnwindIntermediateHashesStage(u *UnwindState, s *StageState, tx kv.RwTx, cf
 }
 
 func unwindIntermediateHashesStageImpl(logPrefix string, u *UnwindState, s *StageState, db kv.RwTx, cfg TrieCfg, expectedRootHash common.Hash, quit <-chan struct{}) error {
-	p := NewHashPromoter(db, quit)
-	p.TempDir = cfg.tmpDir
+	p := NewHashPromoter(db, cfg.tmpDir, quit, logPrefix)
 	rl := trie.NewRetainList(0)
 	collect := func(k, v []byte, _ etl.CurrentTableReader, _ etl.LoadNextFunc) error {
 		rl.AddKeyWithMarker(k, len(v) == 0)

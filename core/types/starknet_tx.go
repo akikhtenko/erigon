@@ -2,18 +2,22 @@ package types
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
-	"github.com/holiman/uint256"
-	"github.com/ledgerwatch/erigon/common"
-	"github.com/ledgerwatch/erigon/rlp"
 	"io"
 	"math/big"
 	"math/bits"
+
+	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon/common"
+	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/erigon/rlp"
 )
 
 type StarknetTransaction struct {
 	CommonTx
 
+	Salt       []byte // cairo contract address salt
 	Tip        *uint256.Int
 	FeeCap     *uint256.Int
 	AccessList AccessList
@@ -21,6 +25,10 @@ type StarknetTransaction struct {
 
 func (tx StarknetTransaction) Type() byte {
 	return StarknetType
+}
+
+func (tx StarknetTransaction) GetSalt() []byte {
+	return tx.Salt
 }
 
 func (tx StarknetTransaction) IsStarkNet() bool {
@@ -112,8 +120,37 @@ func (tx StarknetTransaction) Cost() *uint256.Int {
 	panic("implement me")
 }
 
-func (tx StarknetTransaction) AsMessage(s Signer, baseFee *big.Int) (Message, error) {
-	panic("implement me")
+func (tx StarknetTransaction) AsMessage(s Signer, baseFee *big.Int, rules *params.Rules) (Message, error) {
+	msg := Message{
+		nonce:      tx.Nonce,
+		gasLimit:   tx.Gas,
+		tip:        *tx.Tip,
+		feeCap:     *tx.FeeCap,
+		to:         tx.To,
+		amount:     *tx.Value,
+		data:       tx.Data,
+		accessList: tx.AccessList,
+		checkNonce: true,
+	}
+
+	if !rules.IsStarknet {
+		return msg, errors.New("starknet tx not supported")
+	}
+
+	if baseFee != nil {
+		overflow := msg.gasPrice.SetFromBig(baseFee)
+		if overflow {
+			return msg, fmt.Errorf("gasPrice higher than 2^256-1")
+		}
+	}
+	msg.gasPrice.Add(&msg.gasPrice, tx.Tip)
+	if msg.gasPrice.Gt(tx.FeeCap) {
+		msg.gasPrice.Set(tx.FeeCap)
+	}
+
+	var err error
+	msg.from, err = tx.Sender(s)
+	return msg, err
 }
 
 func (tx *StarknetTransaction) WithSignature(signer Signer, sig []byte) (Transaction, error) {
@@ -154,7 +191,20 @@ func (tx StarknetTransaction) Hash() common.Hash {
 }
 
 func (tx StarknetTransaction) SigningHash(chainID *big.Int) common.Hash {
-	panic("implement me")
+	return prefixedRlpHash(
+		StarknetType,
+		[]interface{}{
+			chainID,
+			tx.Nonce,
+			tx.Tip,
+			tx.FeeCap,
+			tx.Gas,
+			tx.To,
+			tx.Value,
+			tx.Data,
+			tx.Salt,
+			tx.AccessList,
+		})
 }
 
 func (tx StarknetTransaction) Size() common.StorageSize {
@@ -182,8 +232,40 @@ func (tx StarknetTransaction) MarshalBinary(w io.Writer) error {
 	return nil
 }
 
-func (tx StarknetTransaction) Sender(signer Signer) (common.Address, error) {
-	panic("implement me")
+func (tx *StarknetTransaction) Sender(signer Signer) (common.Address, error) {
+	if sc := tx.from.Load(); sc != nil {
+		return sc.(common.Address), nil
+	}
+	addr, err := signer.Sender(tx)
+	if err != nil {
+		return common.Address{}, err
+	}
+	tx.from.Store(addr)
+	return addr, nil
+}
+
+func (tx StarknetTransaction) EncodeRLP(w io.Writer) error {
+	payloadSize, nonceLen, gasLen, accessListLen := tx.payloadSize()
+	envelopeSize := payloadSize
+	if payloadSize >= 56 {
+		envelopeSize += (bits.Len(uint(payloadSize)) + 7) / 8
+	}
+	// size of struct prefix and TxType
+	envelopeSize += 2
+	var b [33]byte
+	// envelope
+	if err := EncodeStringSizePrefix(envelopeSize, w, b[:]); err != nil {
+		return err
+	}
+	// encode TxType
+	b[0] = StarknetType
+	if _, err := w.Write(b[:1]); err != nil {
+		return err
+	}
+	if err := tx.encodePayload(w, b[:], payloadSize, nonceLen, gasLen, accessListLen); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (tx StarknetTransaction) encodePayload(w io.Writer, b []byte, payloadSize, nonceLen, gasLen, accessListLen int) error {
@@ -396,10 +478,10 @@ func (tx StarknetTransaction) copy() *StarknetTransaction {
 			Nonce:   tx.Nonce,
 			To:      tx.To,
 			Data:    common.CopyBytes(tx.Data),
-			Salt:    common.CopyBytes(tx.Salt),
 			Gas:     tx.Gas,
 			Value:   new(uint256.Int),
 		},
+		Salt:       common.CopyBytes(tx.Salt),
 		AccessList: make(AccessList, len(tx.AccessList)),
 		Tip:        new(uint256.Int),
 		FeeCap:     new(uint256.Int),
@@ -421,4 +503,15 @@ func (tx StarknetTransaction) copy() *StarknetTransaction {
 	cpy.R.Set(&tx.R)
 	cpy.S.Set(&tx.S)
 	return cpy
+}
+
+func (tx StarknetTransaction) EncodingSize() int {
+	payloadSize, _, _, _ := tx.payloadSize()
+	envelopeSize := payloadSize
+	// Add envelope size and type size
+	if payloadSize >= 56 {
+		envelopeSize += (bits.Len(uint(payloadSize)) + 7) / 8
+	}
+	envelopeSize += 2
+	return envelopeSize
 }

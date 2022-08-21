@@ -9,26 +9,17 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon-lib/common/dbg"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/interfaces"
+	"github.com/ledgerwatch/log/v3"
+
 	"github.com/ledgerwatch/erigon/common"
-	"github.com/ledgerwatch/erigon/consensus"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
-	"github.com/ledgerwatch/erigon/p2p/enode"
 	"github.com/ledgerwatch/erigon/turbo/adapter"
-	"github.com/ledgerwatch/erigon/turbo/stages/headerdownload"
-	"github.com/ledgerwatch/log/v3"
+	"github.com/ledgerwatch/erigon/turbo/services"
 )
 
 const BlockBufferSize = 128
-
-// VerifyUnclesFunc validates the given block's uncles and verifies the block
-// header's transaction and uncle roots. The headers are assumed to be already
-// validated at this point.
-// It returns 2 errors - first is Validation error (reason to penalize peer and continue processing other
-// bodies), second is internal runtime error (like network error or db error)
-type VerifyUnclesFunc func(peerID enode.ID, header *types.Header, uncles []*types.Header) error
 
 // UpdateFromDb reads the state of the database and refreshes the state of the body download
 func (bd *BodyDownload) UpdateFromDb(db kv.Tx) (headHeight uint64, headHash common.Hash, headTd256 *uint256.Int, err error) {
@@ -55,7 +46,7 @@ func (bd *BodyDownload) UpdateFromDb(db kv.Tx) (headHeight uint64, headHash comm
 		bd.deliveriesB[i] = nil
 		bd.requests[i] = nil
 	}
-	bd.peerMap = make(map[enode.ID]int)
+	bd.peerMap = make(map[[64]byte]int)
 	headHeight = bodyProgress
 	headHash, err = rawdb.ReadCanonicalHash(db, headHeight)
 	if err != nil {
@@ -78,7 +69,7 @@ func (bd *BodyDownload) UpdateFromDb(db kv.Tx) (headHeight uint64, headHash comm
 }
 
 // RequestMoreBodies - returns nil if nothing to request
-func (bd *BodyDownload) RequestMoreBodies(db kv.Tx, blockReader interfaces.FullBlockReader, blockNum uint64, currentTime uint64, blockPropagator adapter.BlockPropagator) (*BodyRequest, uint64, error) {
+func (bd *BodyDownload) RequestMoreBodies(tx kv.RwTx, blockReader services.FullBlockReader, blockNum uint64, currentTime uint64, blockPropagator adapter.BlockPropagator) (*BodyRequest, uint64, error) {
 	if blockNum < bd.requestedLow {
 		blockNum = bd.requestedLow
 	}
@@ -115,17 +106,17 @@ func (bd *BodyDownload) RequestMoreBodies(db kv.Tx, blockReader interfaces.FullB
 			}
 			hash = header.Hash()
 		} else {
-			hash, err = rawdb.ReadCanonicalHash(db, blockNum)
+			hash, err = rawdb.ReadCanonicalHash(tx, blockNum)
 			if err != nil {
 				return nil, 0, fmt.Errorf("could not find canonical header: %w, blockNum=%d, trace=%s", err, blockNum, dbg.Stack())
 			}
 
-			header, err = blockReader.Header(context.Background(), db, hash, blockNum)
+			header, err = blockReader.Header(context.Background(), tx, hash, blockNum)
 			if err != nil {
 				return nil, 0, fmt.Errorf("header not found: %w, blockNum=%d, trace=%s", err, blockNum, dbg.Stack())
 			}
 			if header == nil {
-				return nil, 0, fmt.Errorf("header not found: blockNum=%d, trace=%s", blockNum, dbg.Stack())
+				return nil, 0, fmt.Errorf("header not found: blockNum=%d, hash=%x, trace=%s", blockNum, hash, dbg.Stack())
 			}
 
 			if block := bd.prefetchedBlocks.Pop(hash); block != nil {
@@ -134,12 +125,13 @@ func (bd *BodyDownload) RequestMoreBodies(db kv.Tx, blockReader interfaces.FullB
 				bd.deliveriesB[blockNum-bd.requestedLow] = block.RawBody()
 
 				// Calculate the TD of the block (it's not imported yet, so block.Td is not valid)
-				var td *big.Int
-				if parent, err := rawdb.ReadTd(db, block.ParentHash(), block.NumberU64()-1); err != nil {
+				if parent, err := rawdb.ReadTd(tx, block.ParentHash(), block.NumberU64()-1); err != nil {
 					log.Error("Failed to ReadTd", "err", err, "number", block.NumberU64()-1, "hash", block.ParentHash())
 				} else if parent != nil {
-					td = new(big.Int).Add(block.Difficulty(), parent)
-					go blockPropagator(context.Background(), block, td)
+					if block.Difficulty().Sign() != 0 { // don't propagate proof-of-stake blocks
+						td := new(big.Int).Add(block.Difficulty(), parent)
+						go blockPropagator(context.Background(), block, td)
+					}
 				} else {
 					log.Error("Propagating dangling block", "number", block.Number(), "hash", hash)
 				}
@@ -148,7 +140,7 @@ func (bd *BodyDownload) RequestMoreBodies(db kv.Tx, blockReader interfaces.FullB
 				bd.deliveriesH[blockNum-bd.requestedLow] = header
 				if header.UncleHash != types.EmptyUncleHash || header.TxHash != types.EmptyRootHash {
 					// Perhaps we already have this block
-					block = rawdb.ReadBlock(db, hash, blockNum)
+					block = rawdb.ReadBlock(tx, hash, blockNum)
 					if block == nil {
 						var doubleHash DoubleHash
 						copy(doubleHash[:], header.UncleHash.Bytes())
@@ -181,7 +173,7 @@ func (bd *BodyDownload) RequestMoreBodies(db kv.Tx, blockReader interfaces.FullB
 	return bodyReq, blockNum, nil
 }
 
-func (bd *BodyDownload) RequestSent(bodyReq *BodyRequest, timeWithTimeout uint64, peer enode.ID) {
+func (bd *BodyDownload) RequestSent(bodyReq *BodyRequest, timeWithTimeout uint64, peer [64]byte) {
 	for _, blockNum := range bodyReq.BlockNums {
 		if blockNum < bd.requestedLow {
 			continue
@@ -195,7 +187,7 @@ func (bd *BodyDownload) RequestSent(bodyReq *BodyRequest, timeWithTimeout uint64
 }
 
 // DeliverBodies takes the block body received from a peer and adds it to the various data structures
-func (bd *BodyDownload) DeliverBodies(txs [][][]byte, uncles [][]*types.Header, lenOfP2PMsg uint64, peerID enode.ID) {
+func (bd *BodyDownload) DeliverBodies(txs *[][][]byte, uncles *[][]*types.Header, lenOfP2PMsg uint64, peerID [64]byte) {
 	bd.deliveryCh <- Delivery{txs: txs, uncles: uncles, lenOfP2PMessage: lenOfP2PMsg, peerID: peerID}
 
 	select {
@@ -221,7 +213,7 @@ func (rt RawTransactions) EncodeIndex(i int, w *bytes.Buffer) {
 			w.Write(rt[i][1:]) //nolint:errcheck
 			return
 		} else if firstByte >= 184 && firstByte < 192 {
-			// RLP striong >= 56 bytes long, firstByte-183 is the length of encoded size
+			// RLP string >= 56 bytes long, firstByte-183 is the length of encoded size
 			w.Write(rt[i][1+firstByte-183:]) //nolint:errcheck
 			return
 		}
@@ -240,8 +232,19 @@ Loop:
 			break Loop
 		}
 
+		if delivery.txs == nil {
+			log.Warn("nil transactions delivered", "peer_id", delivery.peerID, "p2p_msg_len", delivery.lenOfP2PMessage)
+		}
+		if delivery.uncles == nil {
+			log.Warn("nil uncles delivered", "peer_id", delivery.peerID, "p2p_msg_len", delivery.lenOfP2PMessage)
+		}
+		if delivery.txs == nil || delivery.uncles == nil {
+			log.Debug("delivery body processing has been skipped due to nil tx|data")
+			continue
+		}
+
 		reqMap := make(map[uint64]*BodyRequest)
-		txs, uncles, lenOfP2PMessage, _ := delivery.txs, delivery.uncles, delivery.lenOfP2PMessage, delivery.peerID
+		txs, uncles, lenOfP2PMessage, _ := *delivery.txs, *delivery.uncles, delivery.lenOfP2PMessage, delivery.peerID
 		var delivered, undelivered int
 
 		for i := range txs {
@@ -251,7 +254,7 @@ Loop:
 			copy(doubleHash[:], uncleHash.Bytes())
 			copy(doubleHash[common.HashLength:], txHash.Bytes())
 
-			// Block numbers are added to the bd.delivered bitmap here, only for blocks for which the body has been received, and their double hashes are present in the bd.requesredMap
+			// Block numbers are added to the bd.delivered bitmap here, only for blocks for which the body has been received, and their double hashes are present in the bd.requestedMap
 			// Also, block numbers can be added to bd.delivered for empty blocks, above
 			blockNum, ok := bd.requestedMap[doubleHash]
 			if !ok {
@@ -290,27 +293,6 @@ func (bd *BodyDownload) DeliverySize(delivered float64, wasted float64) {
 	bd.wastedCount += wasted
 }
 
-// ValidateBody validates the given block's uncles and verifies the block
-// header's transaction and uncle roots. The headers are assumed to be already
-// validated at this point.
-// It returns 2 errors - first is Validation error (reason to penalize peer and continue processing other
-// bodies), second is internal runtime error (like network error or db error)
-func (bd *BodyDownload) VerifyUncles(header *types.Header, uncles []*types.Header, r consensus.ChainReader) (headerdownload.Penalty, error) {
-
-	// Header validity is known at this point, check the uncles and transactions
-	//header := block.Header()
-	if err := bd.Engine.VerifyUncles(r, header, uncles); err != nil {
-		return headerdownload.BadBlockPenalty, err
-	}
-	//if hash := types.CalcUncleHash(block.Uncles()); hash != header.UncleHash {
-	//	return headerdownload.BadBlockPenalty, fmt.Errorf("uncle root hash mismatch: have %x, want %x", hash, header.UncleHash), nil
-	//}
-	//if hash := types.DeriveSha(block.Transactions()); hash != header.TxHash {
-	//	return headerdownload.BadBlockPenalty, fmt.Errorf("transaction root hash mismatch: have %x, want %x", hash, header.TxHash), nil
-	//}
-	return headerdownload.NoPenalty, nil
-}
-
 func (bd *BodyDownload) GetDeliveries() ([]*types.Header, []*types.RawBody, error) {
 	err := bd.doDeliverBodies() // TODO: join this 2 funcs and simplify
 	if err != nil {
@@ -347,8 +329,8 @@ func (bd *BodyDownload) DeliveryCounts() (float64, float64) {
 	return bd.deliveredCount, bd.wastedCount
 }
 
-func (bd *BodyDownload) GetPenaltyPeers() []enode.ID {
-	peers := make([]enode.ID, len(bd.peerMap))
+func (bd *BodyDownload) GetPenaltyPeers() [][64]byte {
+	peers := make([][64]byte, len(bd.peerMap))
 	i := 0
 	for p := range bd.peerMap {
 		peers[i] = p
@@ -363,7 +345,7 @@ func (bd *BodyDownload) PrintPeerMap() {
 		fmt.Printf("%s = %d\n", p, n)
 	}
 	fmt.Printf("---------------------------\n")
-	bd.peerMap = make(map[enode.ID]int)
+	bd.peerMap = make(map[[64]byte]int)
 }
 
 func (bd *BodyDownload) AddToPrefetch(block *types.Block) {

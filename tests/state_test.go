@@ -14,6 +14,8 @@
 // You should have received a copy of the GNU Lesser General Public License
 // along with the go-ethereum library. If not, see <http://www.gnu.org/licenses/>.
 
+//go:build integration
+
 package tests
 
 import (
@@ -44,15 +46,6 @@ func TestState(t *testing.T) {
 	st.skipLoad(`^stTimeConsuming/`)
 	st.skipLoad(`.*vmPerformance/loop.*`)
 
-	// Broken tests:
-	st.skipLoad(`^stCreate2/create2collisionStorage.json`)
-	st.skipLoad(`^stExtCodeHash/dynamicAccountOverwriteEmpty.json`)
-	st.skipLoad(`^stSStoreTest/InitCollision.json`)
-	st.skipLoad(`^stEIP1559/typeTwoBerlin.json`)
-
-	// value exceeding 256 bit is not supported
-	st.skipLoad(`^stTransactionTest/ValueOverflow.json`)
-
 	st.walk(t, stateTestDir, func(t *testing.T, name string, test *StateTest) {
 		db := memdb.NewTestDB(t)
 		for _, subtest := range test.Subtests() {
@@ -72,6 +65,10 @@ func TestState(t *testing.T) {
 					defer tx.Rollback()
 					_, err = test.Run(rules, tx, subtest, vmconfig)
 					tx.Rollback()
+					if err != nil && len(test.json.Post[subtest.Fork][subtest.Index].ExpectException) > 0 {
+						// Ignore expected errors
+						return nil
+					}
 					return st.checkFailure(t, err)
 				})
 			})

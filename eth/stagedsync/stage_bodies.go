@@ -9,13 +9,12 @@ import (
 	"github.com/c2h5oh/datasize"
 	libcommon "github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/kv"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/interfaces"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/eth/stagedsync/stages"
-	"github.com/ledgerwatch/erigon/p2p/enode"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/turbo/adapter"
+	"github.com/ledgerwatch/erigon/turbo/services"
 	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
 	"github.com/ledgerwatch/erigon/turbo/stages/bodydownload"
 	"github.com/ledgerwatch/erigon/turbo/stages/headerdownload"
@@ -25,27 +24,27 @@ import (
 type BodiesCfg struct {
 	db              kv.RwDB
 	bd              *bodydownload.BodyDownload
-	bodyReqSend     func(context.Context, *bodydownload.BodyRequest) (enode.ID, bool)
+	bodyReqSend     func(context.Context, *bodydownload.BodyRequest) ([64]byte, bool)
 	penalise        func(context.Context, []headerdownload.PenaltyItem)
 	blockPropagator adapter.BlockPropagator
 	timeout         int
 	chanConfig      params.ChainConfig
 	batchSize       datasize.ByteSize
-	snapshots       *snapshotsync.AllSnapshots
-	blockReader     interfaces.FullBlockReader
+	snapshots       *snapshotsync.RoSnapshots
+	blockReader     services.FullBlockReader
 }
 
 func StageBodiesCfg(
 	db kv.RwDB,
 	bd *bodydownload.BodyDownload,
-	bodyReqSend func(context.Context, *bodydownload.BodyRequest) (enode.ID, bool),
+	bodyReqSend func(context.Context, *bodydownload.BodyRequest) ([64]byte, bool),
 	penalise func(context.Context, []headerdownload.PenaltyItem),
 	blockPropagator adapter.BlockPropagator,
 	timeout int,
 	chanConfig params.ChainConfig,
 	batchSize datasize.ByteSize,
-	snapshots *snapshotsync.AllSnapshots,
-	blockReader interfaces.FullBlockReader,
+	snapshots *snapshotsync.RoSnapshots,
+	blockReader services.FullBlockReader,
 ) BodiesCfg {
 	return BodiesCfg{db: db, bd: bd, bodyReqSend: bodyReqSend, penalise: penalise, blockPropagator: blockPropagator, timeout: timeout, chanConfig: chanConfig, batchSize: batchSize, snapshots: snapshots, blockReader: blockReader}
 }
@@ -60,6 +59,11 @@ func BodiesForward(
 	test bool, // Set to true in tests, allows the stage to fail rather than wait indefinitely
 	firstCycle bool,
 ) error {
+	var doUpdate bool
+	if cfg.snapshots != nil && s.BlockNumber < cfg.snapshots.BlocksAvailable() {
+		s.BlockNumber = cfg.snapshots.BlocksAvailable()
+		doUpdate = true
+	}
 
 	var d1, d2, d3, d4, d5, d6 time.Duration
 	var err error
@@ -73,12 +77,11 @@ func BodiesForward(
 	}
 	timeout := cfg.timeout
 
-	if cfg.snapshots != nil {
-		if s.BlockNumber < cfg.snapshots.BlocksAvailable() {
-			if err := s.Update(tx, cfg.snapshots.BlocksAvailable()); err != nil {
-				return err
-			}
-			s.BlockNumber = cfg.snapshots.BlocksAvailable()
+	// this update is required, because cfg.bd.UpdateFromDb(tx) below reads it and initialises requestedLow accordingly
+	// if not done, it will cause downloading from block 1
+	if doUpdate {
+		if err := s.Update(tx, s.BlockNumber); err != nil {
+			return err
 		}
 	}
 	// This will update bd.maxProgress
@@ -91,7 +94,7 @@ func BodiesForward(
 		return err
 	}
 	bodyProgress = s.BlockNumber
-	if bodyProgress == headerProgress {
+	if bodyProgress >= headerProgress {
 		return nil
 	}
 
@@ -118,7 +121,7 @@ func BodiesForward(
 	timer := time.NewTimer(1 * time.Second) // Check periodically even in the abseence of incoming messages
 	var blockNum uint64
 	var req *bodydownload.BodyRequest
-	var peer enode.ID
+	var peer [64]byte
 	var sentToPeer bool
 	stopped := false
 	prevProgress := bodyProgress
@@ -135,7 +138,7 @@ Loop:
 			}
 			d1 += time.Since(start)
 		}
-		peer = enode.ID{}
+		peer = [64]byte{}
 		sentToPeer = false
 		if req != nil {
 			start := time.Now()
@@ -156,7 +159,7 @@ Loop:
 				return fmt.Errorf("request more bodies: %w", err)
 			}
 			d1 += time.Since(start)
-			peer = enode.ID{}
+			peer = [64]byte{}
 			sentToPeer = false
 			if req != nil {
 				start = time.Now()
@@ -180,16 +183,17 @@ Loop:
 		for i, header := range headers {
 			rawBody := rawBodies[i]
 			blockHeight := header.Number.Uint64()
-			_, err := cfg.bd.VerifyUncles(header, rawBody.Uncles, cr)
+			// Txn & uncle roots are verified via bd.requestedMap
+			err := cfg.bd.Engine.VerifyUncles(cr, header, rawBody.Uncles)
 			if err != nil {
-				log.Error(fmt.Sprintf("[%s] Uncle verification failed", logPrefix), "number", blockHeight, "hash", header.Hash().String(), "error", err)
+				log.Error(fmt.Sprintf("[%s] Uncle verification failed", logPrefix), "number", blockHeight, "hash", header.Hash().String(), "err", err)
 				u.UnwindTo(blockHeight-1, header.Hash())
 				break Loop
 			}
 
 			// Check existence before write - because WriteRawBody isn't idempotent (it allocates new sequence range for transactions on every call)
 			if err = rawdb.WriteRawBodyIfNotExists(tx, header.Hash(), blockHeight, rawBody); err != nil {
-				return fmt.Errorf("writing block body: %w", err)
+				return fmt.Errorf("WriteRawBodyIfNotExists: %w", err)
 			}
 
 			if blockHeight > bodyProgress {
@@ -255,14 +259,20 @@ Loop:
 func logProgressBodies(logPrefix string, committed uint64, prevDeliveredCount, deliveredCount, prevWastedCount, wastedCount float64) {
 	speed := (deliveredCount - prevDeliveredCount) / float64(logInterval/time.Second)
 	wastedSpeed := (wastedCount - prevWastedCount) / float64(logInterval/time.Second)
+	if speed == 0 && wastedSpeed == 0 {
+		// Don't log "Wrote block ..." unless we're actually writing something
+		return
+	}
+
 	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
+	libcommon.ReadMemStats(&m)
 	log.Info(fmt.Sprintf("[%s] Wrote block bodies", logPrefix),
 		"block_num", committed,
-		"delivery/sec", common.StorageSize(speed),
-		"wasted/sec", common.StorageSize(wastedSpeed),
-		"alloc", common.StorageSize(m.Alloc),
-		"sys", common.StorageSize(m.Sys))
+		"delivery/sec", libcommon.ByteCount(uint64(speed)),
+		"wasted/sec", libcommon.ByteCount(uint64(wastedSpeed)),
+		"alloc", libcommon.ByteCount(m.Alloc),
+		"sys", libcommon.ByteCount(m.Sys),
+	)
 }
 
 func UnwindBodiesStage(u *UnwindState, tx kv.RwTx, cfg BodiesCfg, ctx context.Context) (err error) {
@@ -278,7 +288,8 @@ func UnwindBodiesStage(u *UnwindState, tx kv.RwTx, cfg BodiesCfg, ctx context.Co
 	logEvery := time.NewTicker(logInterval)
 	defer logEvery.Stop()
 
-	if err := rawdb.MakeBodiesNonCanonical(tx, u.UnwindPoint+1, ctx, u.LogPrefix(), logEvery); err != nil {
+	badBlock := u.BadBlock != (common.Hash{})
+	if err := rawdb.MakeBodiesNonCanonical(tx, u.UnwindPoint+1, badBlock /* deleteBodies */, ctx, u.LogPrefix(), logEvery); err != nil {
 		return err
 	}
 

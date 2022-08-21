@@ -241,6 +241,7 @@ func StartPProf(address string, withMetrics bool) {
 	// from the registry into expvar, and execute regular expvar handler.
 	if withMetrics {
 		http.HandleFunc("/debug/metrics/prometheus", func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
 			metrics2.WritePrometheus(w, true)
 		})
 	}
@@ -265,10 +266,10 @@ func Exit() {
 func RaiseFdLimit() {
 	limit, err := fdlimit.Maximum()
 	if err != nil {
-		log.Error("Failed to retrieve file descriptor allowance", "error", err)
+		log.Error("Failed to retrieve file descriptor allowance", "err", err)
 		return
 	}
 	if _, err = fdlimit.Raise(uint64(limit)); err != nil {
-		log.Error("Failed to raise file descriptor allowance", "error", err)
+		log.Error("Failed to raise file descriptor allowance", "err", err)
 	}
 }

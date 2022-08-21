@@ -99,7 +99,7 @@ func TruncateRange(db kv.RwTx, bucket string, key []byte, to uint32) error {
 		if !bytes.HasPrefix(k, key) {
 			return false, nil
 		}
-		if err := db.Delete(bucket, k, nil); err != nil {
+		if err := db.Delete(bucket, k); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -154,6 +154,7 @@ func Get(db kv.Tx, bucket string, key []byte, from, to uint32) (*roaring.Bitmap,
 }
 
 // SeekInBitmap - returns value in bitmap which is >= n
+//
 //nolint:deadcode
 func SeekInBitmap(m *roaring.Bitmap, n uint32) (found uint32, ok bool) {
 	i := m.Iterator()
@@ -253,7 +254,7 @@ func TruncateRange64(db kv.RwTx, bucket string, key []byte, to uint64) error {
 		if !bytes.HasPrefix(k, key) {
 			return false, nil
 		}
-		if err := cDel.Delete(k, nil); err != nil {
+		if err := cDel.Delete(k); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -311,9 +312,16 @@ func Get64(db kv.Tx, bucket string, key []byte, from, to uint64) (*roaring64.Bit
 
 // SeekInBitmap - returns value in bitmap which is >= n
 func SeekInBitmap64(m *roaring64.Bitmap, n uint64) (found uint64, ok bool) {
-	m.RemoveRange(0, n)
 	if m.IsEmpty() {
 		return 0, false
 	}
-	return m.Minimum(), true
+	if n == 0 {
+		return m.Minimum(), true
+	}
+	searchRank := m.Rank(n - 1)
+	if searchRank >= m.GetCardinality() {
+		return 0, false
+	}
+	found, _ = m.Select(searchRank)
+	return found, true
 }

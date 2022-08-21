@@ -11,7 +11,6 @@ import (
 	"github.com/ledgerwatch/erigon-lib/gointerfaces/txpool"
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
 	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/commands"
-	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/filters"
 	"github.com/ledgerwatch/erigon/cmd/rpcdaemon/rpcdaemontest"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/u256"
@@ -20,6 +19,7 @@ import (
 	"github.com/ledgerwatch/erigon/eth/protocols/eth"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rlp"
+	"github.com/ledgerwatch/erigon/turbo/rpchelper"
 	"github.com/ledgerwatch/erigon/turbo/snapshotsync"
 	"github.com/ledgerwatch/erigon/turbo/stages"
 	"github.com/stretchr/testify/require"
@@ -31,7 +31,7 @@ func TestSendRawTransaction(t *testing.T) {
 
 	chain, err := core.GenerateChain(m.ChainConfig, m.Genesis, m.Engine, m.DB, 1, func(i int, b *core.BlockGen) {
 		b.SetCoinbase(common.Address{1})
-	}, false /* intemediateHashes */)
+	}, false /* intermediateHashes */)
 	require.NoError(err)
 	{ // Do 1 step to start txPool
 
@@ -70,16 +70,15 @@ func TestSendRawTransaction(t *testing.T) {
 
 	ctx, conn := rpcdaemontest.CreateTestGrpcConn(t, m)
 	txPool := txpool.NewTxpoolClient(conn)
-	ff := filters.New(ctx, nil, txPool, txpool.NewMiningClient(conn))
+	ff := rpchelper.New(ctx, nil, txPool, txpool.NewMiningClient(conn), func() {})
 	stateCache := kvcache.New(kvcache.DefaultCoherentConfig)
-	api := commands.NewEthAPI(commands.NewBaseApi(ff, stateCache, snapshotsync.NewBlockReader(), false), m.DB, nil, txPool, nil, 5000000)
+	api := commands.NewEthAPI(commands.NewBaseApi(ff, stateCache, snapshotsync.NewBlockReader(), nil, nil, false), m.DB, nil, txPool, nil, 5000000)
 
 	buf := bytes.NewBuffer(nil)
 	err = txn.MarshalBinary(buf)
 	require.NoError(err)
 
 	txsCh := make(chan []types.Transaction, 1)
-	defer close(txsCh)
 	id := ff.SubscribePendingTxs(txsCh)
 	defer ff.UnsubscribePendingTxs(id)
 
@@ -98,7 +97,7 @@ func TestSendRawTransaction(t *testing.T) {
 	//TODO: make propagation easy to test - now race
 	//time.Sleep(time.Second)
 	//sent := m.SentMessage(0)
-	//require.Equal(eth.ToProto[m.SentryClient.Protocol()][eth.NewPooledTransactionHashesMsg], sent.Id)
+	//require.Equal(eth.ToProto[m.MultiClient.Protocol()][eth.NewPooledTransactionHashesMsg], sent.Id)
 }
 
 func transaction(nonce uint64, gaslimit uint64, key *ecdsa.PrivateKey) types.Transaction {

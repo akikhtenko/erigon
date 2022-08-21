@@ -1,5 +1,4 @@
 //go:build gorules
-// +build gorules
 
 package gorules
 
@@ -48,6 +47,12 @@ func closeCollector(m dsl.Matcher) {
 	m.Match(`$c := etl.NewCollector($*_); $close`).
 		Where(!m["close"].Text.Matches(`defer .*\.Close()`)).
 		Report(`Add "defer $c.Close()" right after collector creation`)
+}
+
+func closeLockedDir(m dsl.Matcher) {
+	m.Match(`$c := dir.OpenRw($*_); $close`).
+		Where(!m["close"].Text.Matches(`defer .*\.Close()`)).
+		Report(`Add "defer $c.Close()" after locked.OpenDir`)
 }
 
 func passValuesByContext(m dsl.Matcher) {

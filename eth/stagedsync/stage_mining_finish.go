@@ -5,7 +5,6 @@ import (
 
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/consensus"
-	"github.com/ledgerwatch/erigon/core/rawdb"
 	"github.com/ledgerwatch/erigon/core/types"
 	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/log/v3"
@@ -15,7 +14,7 @@ type MiningFinishCfg struct {
 	db          kv.RwDB
 	chainConfig params.ChainConfig
 	engine      consensus.Engine
-	sealCancel  <-chan struct{}
+	sealCancel  chan struct{}
 	miningState MiningState
 }
 
@@ -24,7 +23,7 @@ func StageMiningFinishCfg(
 	chainConfig params.ChainConfig,
 	engine consensus.Engine,
 	miningState MiningState,
-	sealCancel <-chan struct{},
+	sealCancel chan struct{},
 ) MiningFinishCfg {
 	return MiningFinishCfg{
 		db:          db,
@@ -55,13 +54,7 @@ func SpawnMiningFinishStage(s *StageState, tx kv.RwTx, cfg MiningFinishCfg, quit
 	//}
 	//prev = sealHash
 
-	// If we are on POS, we will send the result on the POS channel
-	isTrans, err := rawdb.Transitioned(tx, block.Header().Number.Uint64(), cfg.chainConfig.TerminalTotalDifficulty)
-	if err != nil {
-		return err
-	}
-
-	if isTrans {
+	if cfg.miningState.MiningResultPOSCh != nil {
 		cfg.miningState.MiningResultPOSCh <- block
 		return nil
 	}
@@ -82,7 +75,12 @@ func SpawnMiningFinishStage(s *StageState, tx kv.RwTx, cfg MiningFinishCfg, quit
 			"difficulty", block.Difficulty(),
 		)
 	}
-
+	// interrupt aborts the in-flight sealing task.
+	select {
+	case cfg.sealCancel <- struct{}{}:
+	default:
+		log.Trace("None in-flight sealing task.")
+	}
 	chain := ChainReader{Cfg: cfg.chainConfig, Db: tx}
 	if err := cfg.engine.Seal(chain, block, cfg.miningState.MiningResultCh, cfg.sealCancel); err != nil {
 		log.Warn("Block sealing failed", "err", err)

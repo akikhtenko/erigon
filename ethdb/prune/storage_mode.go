@@ -2,11 +2,15 @@ package prune
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
+	"strings"
 
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon/params"
+	"github.com/ledgerwatch/log/v3"
 )
 
 var DefaultMode = Mode{
@@ -18,61 +22,88 @@ var DefaultMode = Mode{
 	Experiments: Experiments{}, // all off
 }
 
+var (
+	mainnetDepositContractBlock uint64 = 11052984
+	sepoliaDepositContractBlock uint64 = 1273020
+	goerliDepositContractBlock  uint64 = 4367322
+)
+
 type Experiments struct {
 	TEVM bool
 }
 
-func FromCli(flags string, exactHistory, exactReceipts, exactTxIndex, exactCallTraces,
+func FromCli(chainId uint64, flags string, exactHistory, exactReceipts, exactTxIndex, exactCallTraces,
 	beforeH, beforeR, beforeT, beforeC uint64, experiments []string) (Mode, error) {
 	mode := DefaultMode
-	if flags == "default" || flags == "disabled" {
-		return DefaultMode, nil
-	}
-	mode.Initialised = true
-	for _, flag := range flags {
-		switch flag {
-		case 'h':
-			mode.History = Distance(params.FullImmutabilityThreshold)
-		case 'r':
-			mode.Receipts = Distance(params.FullImmutabilityThreshold)
-		case 't':
-			mode.TxIndex = Distance(params.FullImmutabilityThreshold)
-		case 'c':
-			mode.CallTraces = Distance(params.FullImmutabilityThreshold)
-		default:
-			return DefaultMode, fmt.Errorf("unexpected flag found: %c", flag)
+	if flags != "default" && flags != "disabled" {
+		mode.Initialised = true
+		for _, flag := range flags {
+			switch flag {
+			case 'h':
+				mode.History = Distance(params.FullImmutabilityThreshold)
+			case 'r':
+				mode.Receipts = Distance(params.FullImmutabilityThreshold)
+			case 't':
+				mode.TxIndex = Distance(params.FullImmutabilityThreshold)
+			case 'c':
+				mode.CallTraces = Distance(params.FullImmutabilityThreshold)
+			default:
+				return DefaultMode, fmt.Errorf("unexpected flag found: %c", flag)
+			}
 		}
 	}
 
+	pruneBlockBefore := pruneBlockDefault(chainId)
+
 	if exactHistory > 0 {
+		mode.Initialised = true
 		mode.History = Distance(exactHistory)
 	}
 	if exactReceipts > 0 {
+		mode.Initialised = true
 		mode.Receipts = Distance(exactReceipts)
 	}
 	if exactTxIndex > 0 {
+		mode.Initialised = true
 		mode.TxIndex = Distance(exactTxIndex)
 	}
 	if exactCallTraces > 0 {
+		mode.Initialised = true
 		mode.CallTraces = Distance(exactCallTraces)
 	}
 
 	if beforeH > 0 {
+		mode.Initialised = true
 		mode.History = Before(beforeH)
 	}
 	if beforeR > 0 {
+		if pruneBlockBefore != 0 {
+			log.Warn("specifying prune.before.r might break CL compatibility")
+			if beforeR > pruneBlockBefore {
+				log.Warn("the specified prune.before.r block number is higher than the deposit contract contract block number", "highest block number", pruneBlockBefore)
+			}
+		}
+		mode.Initialised = true
 		mode.Receipts = Before(beforeR)
+	} else {
+		if exactReceipts == 0 && mode.Receipts.Enabled() {
+			mode.Initialised = true
+			mode.Receipts = Before(pruneBlockBefore)
+		}
 	}
 	if beforeT > 0 {
+		mode.Initialised = true
 		mode.TxIndex = Before(beforeT)
 	}
 	if beforeC > 0 {
+		mode.Initialised = true
 		mode.CallTraces = Before(beforeC)
 	}
 
 	for _, ex := range experiments {
 		switch ex {
 		case "tevm":
+			mode.Initialised = true
 			mode.Experiments.TEVM = true
 		case "":
 			// skip
@@ -82,6 +113,19 @@ func FromCli(flags string, exactHistory, exactReceipts, exactTxIndex, exactCallT
 	}
 
 	return mode, nil
+}
+
+func pruneBlockDefault(chainId uint64) uint64 {
+	switch chainId {
+	case 1 /* mainnet */ :
+		return mainnetDepositContractBlock
+	case 11155111 /* sepolia */ :
+		return sepoliaDepositContractBlock
+	case 5 /* goerli */ :
+		return goerliDepositContractBlock
+	}
+
+	return 0
 }
 
 func Get(db kv.Getter) (Mode, error) {
@@ -149,7 +193,9 @@ type BlockAmount interface {
 // Distance amount of blocks to keep in DB
 // but manual manipulation with such distance is very unsafe
 // for example:
-//    deleteUntil := currentStageProgress - pruningDistance
+//
+//	deleteUntil := currentStageProgress - pruningDistance
+//
 // may delete whole db - because of uint64 underflow when pruningDistance > currentStageProgress
 type Distance uint64
 
@@ -188,32 +234,33 @@ func (m Mode) String() string {
 	if !m.Initialised {
 		return "default"
 	}
+	const defaultVal uint64 = params.FullImmutabilityThreshold
 	long := ""
-	short := "--prune="
+	short := ""
 	if m.History.Enabled() {
 		if m.History.useDefaultValue() {
-			short += "h"
+			short += fmt.Sprintf(" --prune.h.older=%d", defaultVal)
 		} else {
 			long += fmt.Sprintf(" --prune.h.%s=%d", m.History.dbType(), m.History.toValue())
 		}
 	}
 	if m.Receipts.Enabled() {
 		if m.Receipts.useDefaultValue() {
-			short += "r"
+			short += fmt.Sprintf(" --prune.r.older=%d", defaultVal)
 		} else {
 			long += fmt.Sprintf(" --prune.r.%s=%d", m.Receipts.dbType(), m.Receipts.toValue())
 		}
 	}
 	if m.TxIndex.Enabled() {
 		if m.TxIndex.useDefaultValue() {
-			short += "t"
+			short += fmt.Sprintf(" --prune.t.older=%d", defaultVal)
 		} else {
 			long += fmt.Sprintf(" --prune.t.%s=%d", m.TxIndex.dbType(), m.TxIndex.toValue())
 		}
 	}
 	if m.CallTraces.Enabled() {
 		if m.CallTraces.useDefaultValue() {
-			short += "c"
+			short += fmt.Sprintf(" --prune.c.older=%d", defaultVal)
 		} else {
 			long += fmt.Sprintf(" --prune.c.%s=%d", m.CallTraces.dbType(), m.CallTraces.toValue())
 		}
@@ -221,7 +268,8 @@ func (m Mode) String() string {
 	if m.Experiments.TEVM {
 		long += " --experiments.tevm=enabled"
 	}
-	return short + long
+
+	return strings.TrimLeft(short+long, " ")
 }
 
 func Override(db kv.RwTx, sm Mode) error {
@@ -257,7 +305,28 @@ func Override(db kv.RwTx, sm Mode) error {
 	return nil
 }
 
-func SetIfNotExist(db kv.GetPut, pm Mode) error {
+// EnsureNotChanged - prohibit change some configs after node creation. prohibit from human mistakes
+func EnsureNotChanged(tx kv.GetPut, pruneMode Mode) (Mode, error) {
+	err := setIfNotExist(tx, pruneMode)
+	if err != nil {
+		return pruneMode, err
+	}
+
+	pm, err := Get(tx)
+	if err != nil {
+		return pruneMode, err
+	}
+
+	if pruneMode.Initialised {
+		// If storage mode is not explicitly specified, we take whatever is in the database
+		if !reflect.DeepEqual(pm, pruneMode) {
+			return pm, errors.New("not allowed change of --prune flag, last time you used: " + pm.String())
+		}
+	}
+	return pm, nil
+}
+
+func setIfNotExist(db kv.GetPut, pm Mode) error {
 	var (
 		err error
 	)

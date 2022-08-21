@@ -73,7 +73,8 @@ type EVMInterpreter struct {
 	jt *JumpTable // EVM instruction table
 }
 
-//structcheck doesn't see embedding
+// structcheck doesn't see embedding
+//
 //nolint:structcheck
 type VM struct {
 	evm *EVM
@@ -100,9 +101,9 @@ func NewEVMInterpreter(evm *EVM, cfg Config) *EVMInterpreter {
 		jt = &constantinopleInstructionSet
 	case evm.ChainRules().IsByzantium:
 		jt = &byzantiumInstructionSet
-	case evm.ChainRules().IsEIP158:
+	case evm.ChainRules().IsSpuriousDragon:
 		jt = &spuriousDragonInstructionSet
-	case evm.ChainRules().IsEIP150:
+	case evm.ChainRules().IsTangerineWhistle:
 		jt = &tangerineWhistleInstructionSet
 	case evm.ChainRules().IsHomestead:
 		jt = &homesteadInstructionSet
@@ -114,7 +115,7 @@ func NewEVMInterpreter(evm *EVM, cfg Config) *EVMInterpreter {
 			if err := EnableEIP(eip, jt); err != nil {
 				// Disable it, so caller can check if it's activated or not
 				cfg.ExtraEips = append(cfg.ExtraEips[:i], cfg.ExtraEips[i+1:]...)
-				log.Error("EIP activation failed", "eip", eip, "error", err)
+				log.Error("EIP activation failed", "eip", eip, "err", err)
 			}
 		}
 	}
@@ -141,9 +142,9 @@ func NewEVMInterpreterByVM(vm *VM) *EVMInterpreter {
 		jt = &constantinopleInstructionSet
 	case vm.evm.ChainRules().IsByzantium:
 		jt = &byzantiumInstructionSet
-	case vm.evm.ChainRules().IsEIP158:
+	case vm.evm.ChainRules().IsSpuriousDragon:
 		jt = &spuriousDragonInstructionSet
-	case vm.evm.ChainRules().IsEIP150:
+	case vm.evm.ChainRules().IsTangerineWhistle:
 		jt = &tangerineWhistleInstructionSet
 	case vm.evm.ChainRules().IsHomestead:
 		jt = &homesteadInstructionSet
@@ -155,7 +156,7 @@ func NewEVMInterpreterByVM(vm *VM) *EVMInterpreter {
 			if err := EnableEIP(eip, jt); err != nil {
 				// Disable it, so caller can check if it's activated or not
 				vm.cfg.ExtraEips = append(vm.cfg.ExtraEips[:i], vm.cfg.ExtraEips[i+1:]...)
-				log.Error("EIP activation failed", "eip", eip, "error", err)
+				log.Error("EIP activation failed", "eip", eip, "err", err)
 			}
 		}
 	}

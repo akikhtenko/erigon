@@ -56,7 +56,7 @@ func MakeSigner(config *params.ChainConfig, blockNumber uint64) *Signer {
 		signer.accesslist = true
 		signer.chainID.Set(&chainId)
 		signer.chainIDMul.Mul(&chainId, u256.Num2)
-	case config.IsEIP155(blockNumber):
+	case config.IsSpuriousDragon(blockNumber):
 		signer.protected = true
 		signer.chainID.Set(&chainId)
 		signer.chainIDMul.Mul(&chainId, u256.Num2)
@@ -98,7 +98,7 @@ func LatestSigner(config *params.ChainConfig) *Signer {
 		if config.BerlinBlock != nil {
 			signer.accesslist = true
 		}
-		if config.EIP155Block != nil {
+		if config.SpuriousDragonBlock != nil {
 			signer.protected = true
 		}
 	}
@@ -225,6 +225,21 @@ func (sg Signer) SenderWithContext(context *secp256k1.Context, tx Transaction) (
 		V.Add(&t.V, u256.Num27)
 		R, S = &t.R, &t.S
 	case *DynamicFeeTransaction:
+		if !sg.dynamicfee {
+			return common.Address{}, fmt.Errorf("dynamicfee tx is not supported by signer %s", sg)
+		}
+		if t.ChainID == nil {
+			if !sg.chainID.IsZero() {
+				return common.Address{}, ErrInvalidChainId
+			}
+		} else if !t.ChainID.Eq(&sg.chainID) {
+			return common.Address{}, ErrInvalidChainId
+		}
+		// ACL and DynamicFee txs are defined to use 0 and 1 as their recovery
+		// id, add 27 to become equivalent to unprotected Homestead signatures.
+		V.Add(&t.V, u256.Num27)
+		R, S = &t.R, &t.S
+	case *StarknetTransaction:
 		if !sg.dynamicfee {
 			return common.Address{}, fmt.Errorf("dynamicfee tx is not supported by signer %s", sg)
 		}

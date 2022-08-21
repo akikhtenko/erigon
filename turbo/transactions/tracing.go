@@ -30,10 +30,10 @@ type BlockGetter interface {
 	GetBlock(hash common.Hash, number uint64) *types.Block
 }
 
-// computeTxEnv returns the execution environment of a certain transaction.
+// ComputeTxEnv returns the execution environment of a certain transaction.
 func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConfig, getHeader func(hash common.Hash, number uint64) *types.Header, contractHasTEVM func(common.Hash) (bool, error), engine consensus.Engine, dbtx kv.Tx, blockHash common.Hash, txIndex uint64) (core.Message, vm.BlockContext, vm.TxContext, *state.IntraBlockState, *state.PlainState, error) {
 	// Create the parent state database
-	reader := state.NewPlainState(dbtx, block.NumberU64()-1)
+	reader := state.NewPlainState(dbtx, block.NumberU64())
 	statedb := state.New(reader)
 
 	if txIndex == 0 && len(block.Transactions()) == 0 {
@@ -42,8 +42,10 @@ func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConf
 	// Recompute transactions up to the target index.
 	signer := types.MakeSigner(cfg, block.NumberU64())
 
-	BlockContext := core.NewEVMBlockContext(block.Header(), getHeader, engine, nil, contractHasTEVM)
+	header := block.Header()
+	BlockContext := core.NewEVMBlockContext(header, core.GetHashFn(header, getHeader), engine, nil, contractHasTEVM)
 	vmenv := vm.NewEVM(BlockContext, vm.TxContext{}, statedb, cfg, vm.Config{})
+	rules := vmenv.ChainRules()
 	for idx, tx := range block.Transactions() {
 		select {
 		default:
@@ -53,7 +55,7 @@ func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConf
 		statedb.Prepare(tx.Hash(), blockHash, idx)
 
 		// Assemble the transaction call message and return if the requested offset
-		msg, _ := tx.AsMessage(*signer, block.BaseFee())
+		msg, _ := tx.AsMessage(*signer, block.BaseFee(), rules)
 		TxContext := core.NewEVMTxContext(msg)
 		if idx == int(txIndex) {
 			return msg, BlockContext, TxContext, statedb, reader, nil
@@ -64,8 +66,8 @@ func ComputeTxEnv(ctx context.Context, block *types.Block, cfg *params.ChainConf
 			return nil, vm.BlockContext{}, vm.TxContext{}, nil, nil, fmt.Errorf("transaction %x failed: %w", tx.Hash(), err)
 		}
 		// Ensure any modifications are committed to the state
-		// Only delete empty objects if EIP158/161 (a.k.a Spurious Dragon) is in effect
-		_ = statedb.FinalizeTx(vmenv.ChainRules(), reader)
+		// Only delete empty objects if EIP161 (part of Spurious Dragon) is in effect
+		_ = statedb.FinalizeTx(rules, reader)
 
 		if idx+1 == len(block.Transactions()) {
 			// Return the state from evaluating all txs in the block, note no msg or TxContext in this case
@@ -130,8 +132,7 @@ func TraceTx(
 	}
 	// Run the transaction with tracing enabled.
 	vmenv := vm.NewEVM(blockCtx, txCtx, ibs, chainConfig, vm.Config{Debug: true, Tracer: tracer})
-
-	var refunds bool = true
+	var refunds = true
 	if config != nil && config.NoRefunds != nil && *config.NoRefunds {
 		refunds = false
 	}
@@ -249,7 +250,7 @@ func (l *JsonStreamLogger) CaptureState(env *vm.EVM, pc uint64, op vm.OpCode, ga
 				value   uint256.Int
 			)
 			env.IntraBlockState().GetState(contract.Address(), &address, &value)
-			l.storage[contract.Address()][address] = common.Hash(value.Bytes32())
+			l.storage[contract.Address()][address] = value.Bytes32()
 			outputStorage = true
 		}
 		// capture SSTORE opcodes and record the written entry in the local storage.

@@ -49,7 +49,11 @@ func (evm *EVM) precompile(addr common.Address) (PrecompiledContract, bool) {
 	case evm.chainRules.IsBerlin:
 		precompiles = PrecompiledContractsBerlin
 	case evm.chainRules.IsIstanbul:
-		precompiles = PrecompiledContractsIstanbul
+		if evm.chainRules.IsParlia {
+			precompiles = PrecompiledContractsIstanbulForBSC
+		} else {
+			precompiles = PrecompiledContractsIstanbul
+		}
 	case evm.chainRules.IsByzantium:
 		precompiles = PrecompiledContractsByzantium
 	default:
@@ -110,6 +114,7 @@ type BlockContext struct {
 	Time        uint64         // Provides information for TIME
 	Difficulty  *big.Int       // Provides information for DIFFICULTY
 	BaseFee     *uint256.Int   // Provides information for BASEFEE
+	PrevRanDao  *common.Hash   // Provides information for PREVRANDAO
 }
 
 // TxContext provides the EVM with information about a transaction.
@@ -142,7 +147,7 @@ type EVM struct {
 	// chainConfig contains information about the current chain
 	chainConfig *params.ChainConfig
 	// chain rules contains the chain rules for the current epoch
-	chainRules params.Rules
+	chainRules *params.Rules
 	// virtual machine configuration options used to initialise the
 	// evm.
 	config Config
@@ -240,7 +245,7 @@ func (evm *EVM) Call(caller ContractRef, addr common.Address, input []byte, gas 
 		snapshot = evm.intraBlockState.Snapshot()
 	)
 	if !evm.intraBlockState.Exist(addr) {
-		if !isPrecompile && evm.chainRules.IsEIP158 && value.IsZero() {
+		if !isPrecompile && evm.chainRules.IsSpuriousDragon && value.IsZero() {
 			return nil, gas, nil
 		}
 		evm.intraBlockState.CreateAccount(addr, false)
@@ -523,7 +528,7 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	// Create a new account on the state
 	snapshot := evm.intraBlockState.Snapshot()
 	evm.intraBlockState.CreateAccount(address, true)
-	if evm.chainRules.IsEIP158 {
+	if evm.chainRules.IsSpuriousDragon {
 		evm.intraBlockState.SetNonce(address, 1)
 	}
 	evm.context.Transfer(evm.intraBlockState, caller.Address(), address, value, false /* bailout */)
@@ -540,7 +545,7 @@ func (evm *EVM) create(caller ContractRef, codeAndHash *codeAndHash, gas uint64,
 	ret, err = run(evm, contract, nil, false)
 
 	// check whether the max code size has been exceeded
-	maxCodeSizeExceeded := evm.chainRules.IsEIP158 && len(ret) > params.MaxCodeSize
+	maxCodeSizeExceeded := evm.chainRules.IsSpuriousDragon && len(ret) > params.MaxCodeSize
 
 	// Reject code starting with 0xEF if EIP-3541 is enabled.
 	if err == nil && !maxCodeSizeExceeded {
@@ -594,7 +599,7 @@ func (evm *EVM) Create(caller ContractRef, code []byte, gas uint64, value *uint2
 // DESCRIBED: docs/programmers_guide/guide.md#nonce
 func (evm *EVM) Create2(caller ContractRef, code []byte, gas uint64, endowment *uint256.Int, salt *uint256.Int) (ret []byte, contractAddr common.Address, leftOverGas uint64, err error) {
 	codeAndHash := &codeAndHash{code: code}
-	contractAddr = crypto.CreateAddress2(caller.Address(), common.Hash(salt.Bytes32()), codeAndHash.Hash().Bytes())
+	contractAddr = crypto.CreateAddress2(caller.Address(), salt.Bytes32(), codeAndHash.Hash().Bytes())
 	return evm.create(caller, codeAndHash, gas, endowment, contractAddr, CREATE2T)
 }
 
@@ -608,7 +613,7 @@ func (evm *EVM) ChainConfig() *params.ChainConfig {
 	return evm.chainConfig
 }
 
-func (evm *EVM) ChainRules() params.Rules {
+func (evm *EVM) ChainRules() *params.Rules {
 	return evm.chainRules
 }
 

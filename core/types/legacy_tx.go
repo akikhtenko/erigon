@@ -26,6 +26,7 @@ import (
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/erigon/common"
 	"github.com/ledgerwatch/erigon/common/u256"
+	"github.com/ledgerwatch/erigon/params"
 	"github.com/ledgerwatch/erigon/rlp"
 )
 
@@ -38,7 +39,6 @@ type CommonTx struct {
 	To      *common.Address `rlp:"nil"` // nil means contract creation
 	Value   *uint256.Int    // wei amount
 	Data    []byte          // contract invocation input data
-	Salt    []byte          // cairo contract address salt
 	V, R, S uint256.Int     // signature values
 }
 
@@ -64,10 +64,6 @@ func (ct CommonTx) GetValue() *uint256.Int {
 
 func (ct CommonTx) GetData() []byte {
 	return ct.Data
-}
-
-func (ct CommonTx) GetSalt() []byte {
-	return ct.Salt
 }
 
 func (ct CommonTx) GetSender() (common.Address, bool) {
@@ -398,7 +394,7 @@ func (tx LegacyTx) EncodeRLP(w io.Writer) error {
 // DecodeRLP decodes LegacyTx but with the list token already consumed and encodingSize being presented
 func (tx *LegacyTx) DecodeRLP(s *rlp.Stream, encodingSize uint64) error {
 	var err error
-	s.NewList(uint64(encodingSize))
+	s.NewList(encodingSize)
 	if tx.Nonce, err = s.Uint(); err != nil {
 		return fmt.Errorf("read Nonce: %w", err)
 	}
@@ -446,7 +442,7 @@ func (tx *LegacyTx) DecodeRLP(s *rlp.Stream, encodingSize uint64) error {
 }
 
 // AsMessage returns the transaction as a core.Message.
-func (tx LegacyTx) AsMessage(s Signer, _ *big.Int) (Message, error) {
+func (tx LegacyTx) AsMessage(s Signer, _ *big.Int, _ *params.Rules) (Message, error) {
 	msg := Message{
 		nonce:      tx.Nonce,
 		gasLimit:   tx.Gas,
